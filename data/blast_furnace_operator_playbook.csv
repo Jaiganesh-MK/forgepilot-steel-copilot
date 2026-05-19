@@ -1,0 +1,6 @@
+Situation,Indicators,Typical operator considerations,Advisory action pattern
+Cold furnace correction,"Low thermal_state_index, falling hot metal temperature, low predicted Si","Avoid overcooling, restore heat input gradually","Reduce wind slightly, reduce PCI, raise coke and oxygen enrichment, increase blast temp if available"
+Hot furnace moderation,"High thermal_state_index, rising Si, high hot metal temperature","Avoid excess fuel and high silicon, protect productivity","Increase wind modestly, raise PCI/substitute coke, reduce coke, reduce oxygen enrichment if needed"
+Permeability recovery,"High pressure drop, low permeability index, tuyere blockage, unstable descent",Stabilize gas flow before pushing production,"Reduce wind, reduce PCI, increase coke support, raise top pressure, shift burden distribution toward center coke"
+Quality stabilization,Si or S moving outside target range,Use small controlled trims; avoid chasing noise,Small fuel/oxygen trim; validate lab delay and sensor status
+Maintain,Risks below threshold,Continue monitoring,No operator setpoint change

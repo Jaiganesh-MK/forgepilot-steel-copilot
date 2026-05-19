@@ -1,0 +1,72 @@
+field,description
+timestamp,Hour-level timestamp for simulated operation.
+furnace_id,Blast furnace identifier.
+shift,Simulated operating shift A/B/C.
+crew,Simulated crew label for handover and operator behavior analysis.
+operating_mode,"Derived operating regime: Normal, Reduced wind, or High productivity."
+event_label,Synthetic ground-truth disturbance window for POC evaluation.
+sensor_quality_flag,Data quality condition for robustness testing.
+ore_fe_pct,"Iron content in burden feed, percent."
+sinter_pct,"Sinter share in burden, percent."
+pellet_pct,"Pellet share in burden, percent."
+lump_ore_pct,"Lump ore share in burden, percent."
+coke_ash_pct,Coke ash percentage; higher values tend to cool furnace and worsen slag volume.
+coke_csr_pct,Coke strength after reaction; lower values tend to worsen permeability.
+coke_moisture_pct,Coke moisture percentage.
+coke_m10_pct,Coke abrasion index proxy.
+burden_basicity_target,Target burden basicity ratio.
+burden_distribution_mode,Charging/distribution condition used by the simulator.
+stockline_left_m,Left-side stockline measurement.
+stockline_right_m,Right-side stockline measurement.
+burden_descent_rate_m_h,Burden descent rate proxy.
+wind_volume_nm3_min,Hot blast wind volume. Operator-adjustable.
+hot_blast_temp_c,Hot blast temperature. Operator-adjustable within constraints.
+blast_pressure_kpa,Blast pressure.
+oxygen_enrichment_pct,Oxygen enrichment. Operator-adjustable.
+blast_humidity_g_nm3,Blast humidity.
+top_pressure_kpa,Top pressure. Operator-adjustable within constraints.
+pci_rate_kg_thm,Pulverized coal injection rate. Operator-adjustable.
+coke_rate_kg_thm,Coke rate. Operator-adjustable.
+total_fuel_rate_kg_thm,PCI plus coke rate.
+fuel_rate_target_kg_thm,Synthetic target fuel rate.
+top_gas_co_pct,Top gas CO percentage.
+top_gas_co2_pct,Top gas CO2 percentage.
+top_gas_h2_pct,Top gas H2 percentage.
+top_gas_n2_pct,Top gas N2 percentage proxy.
+gas_utilization_pct,CO gas utilization proxy.
+top_gas_temp_c,Top gas temperature.
+pressure_drop_kpa,Furnace pressure drop proxy.
+permeability_index,Higher is better permeability.
+raceway_adiabatic_flame_temp_c,RAFT proxy.
+tuyere_temp_avg_c,Average tuyere temperature.
+active_tuyere_count,Count of active tuyeres.
+tuyere_blockage_count,Simulated tuyere blockage count.
+stave_temp_upper_c,Upper stave temperature.
+stave_temp_middle_c,Middle stave temperature.
+stave_temp_lower_c,Lower stave temperature.
+hearth_sidewall_temp_c,Hearth sidewall temperature.
+hearth_liquid_level_index,Synthetic hearth liquid level index.
+hot_metal_temp_c,Hot metal temperature outcome.
+hot_metal_si_pct,Hot metal silicon percentage outcome.
+hot_metal_s_pct,Hot metal sulfur percentage outcome.
+slag_basicity,Slag basicity outcome.
+slag_volume_kg_thm,Slag volume proxy.
+production_tph,Hot metal production rate.
+thermal_state_index,"Hidden/soft-sensor thermal state index; negative = cold, positive = hot."
+thermal_risk_score,0-100 thermal instability risk.
+permeability_risk_score,0-100 gas-flow/permeability risk.
+quality_risk_score,0-100 hot metal quality risk.
+predicted_si_4h_pct,Synthetic 4-hour forward silicon prediction.
+predicted_hot_metal_temp_4h_c,Synthetic 4-hour forward temperature prediction.
+operator_decision_required,Yes if simulator thinks operator intervention is needed.
+recommended_action_category,Primary recommendation category.
+rec_wind_volume_delta_nm3_min,Recommended change to wind volume; advisory only.
+rec_pci_delta_kg_thm,Recommended PCI-rate change; advisory only.
+rec_coke_rate_delta_kg_thm,Recommended coke-rate change; advisory only.
+rec_oxygen_enrichment_delta_pct,Recommended oxygen enrichment change; advisory only.
+rec_blast_temp_delta_c,Recommended blast temperature change; advisory only.
+rec_top_pressure_delta_kpa,Recommended top-pressure change; advisory only.
+rec_burden_distribution_change,Text recommendation for burden distribution.
+rec_tapping_priority,Normal or Expedite tapping recommendation.
+operator_action_taken,Synthetic historical operator action label; sometimes deviates from recommendation.
+operator_notes,Short natural-language rationale for POC retrieval/explanation.

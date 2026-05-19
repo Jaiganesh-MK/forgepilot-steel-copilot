@@ -1,0 +1,56 @@
+{
+  "dataset_name": "blast_furnace_synthetic_operations_60d_hourly",
+  "rows": 1440,
+  "columns": 71,
+  "start_timestamp": "2026-01-01 00:00:00",
+  "end_timestamp": "2026-03-01 23:00:00",
+  "grain": "hourly",
+  "purpose": "Synthetic POC dataset for blast furnace operator decision-support / agentic AI copilot.",
+  "important_note": "Manufactured data; not suitable for real plant control or safety decisions.",
+  "operator_decision_fields": [
+    "operator_decision_required",
+    "recommended_action_category",
+    "rec_wind_volume_delta_nm3_min",
+    "rec_pci_delta_kg_thm",
+    "rec_coke_rate_delta_kg_thm",
+    "rec_oxygen_enrichment_delta_pct",
+    "rec_blast_temp_delta_c",
+    "rec_top_pressure_delta_kpa",
+    "rec_burden_distribution_change",
+    "rec_tapping_priority",
+    "operator_action_taken",
+    "operator_notes"
+  ],
+  "disturbance_windows": [
+    [
+      180,
+      235,
+      "low_coke_quality"
+    ],
+    [
+      390,
+      430,
+      "high_moisture_burden"
+    ],
+    [
+      610,
+      660,
+      "permeability_loss"
+    ],
+    [
+      845,
+      900,
+      "hot_thermal_drift"
+    ],
+    [
+      1030,
+      1075,
+      "sensor_drift"
+    ],
+    [
+      1190,
+      1235,
+      "slip_risk"
+    ]
+  ]
+}

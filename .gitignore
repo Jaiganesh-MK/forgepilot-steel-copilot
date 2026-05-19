@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+operator_feedback_log.csv
+.streamlit/secrets.toml
+data/operator_decision_log.csv
