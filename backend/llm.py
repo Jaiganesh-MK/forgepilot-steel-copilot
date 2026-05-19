@@ -216,12 +216,13 @@ class ReasoningSynthesizer:
         signals = signals[:max_batch]
 
         if config.OPENROUTER_RELIABILITY_MODE == "simple_free_router" or config.OPENROUTER_AGENT_ROUTING_MODE == "simple_free_router":
-            return self._review_agent_signals_batch_core(
+            # Do not use the broad openrouter/free router for specialist agents.
+            # It can route to small/VL models that often ignore strict JSON instructions.
+            # Use a curated text-model shortlist instead and keep the request shape simple.
+            return self._review_agent_signal_groups(
                 signals,
                 context,
                 timeout_seconds=timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
-                model_candidates=[config.OPENROUTER_FREE_ROUTER_MODEL],
-                group_name="simple_free_router",
             )
 
         if config.OPENROUTER_AGENT_ROUTING_MODE == "grouped" and len(signals) > 1:
@@ -294,10 +295,11 @@ class ReasoningSynthesizer:
         prompt = self._build_agent_batch_review_prompt(signals, context)
         if any(self._is_llm_first_mode(signal) for signal in signals):
             system_prompt = (
-                "You are a team of specialist blast furnace AI decision agents. "
-                "Reason from the supplied plant state, trends, allowed action bounds, and each agent's responsibility. "
-                "Do not rely on deterministic recommendations. Return concise JSON only. "
-                "Never invent measurements or claim automatic execution."
+                "You are a team of specialist blast furnace AI decision agents for an operator decision-support copilot. "
+                "You MUST return one valid JSON object only, with key agent_reviews. No markdown. No prose outside JSON. "
+                "Reason from the supplied plant state, trends, similar cases, allowed action bounds, and each agent playbook. "
+                "For abnormal evidence, propose small bounded advisory actions; for normal evidence, propose monitoring. "
+                "Never invent measurements or claim automatic execution. Setpoint changes require operator approval."
             )
         else:
             system_prompt = (
@@ -393,14 +395,48 @@ class ReasoningSynthesizer:
     @staticmethod
     def _models_for_agent_group(group_name: str) -> list[str]:
         if group_name == "thermal":
-            return config.OPENROUTER_AGENT_THERMAL_MODELS
-        if group_name == "flow":
-            return config.OPENROUTER_AGENT_FLOW_MODELS
-        if group_name == "fuel":
-            return config.OPENROUTER_AGENT_FUEL_MODELS
-        if group_name == "quality":
-            return config.OPENROUTER_AGENT_QUALITY_MODELS
-        return config.OPENROUTER_AGENT_DEFAULT_MODELS
+            models = config.OPENROUTER_AGENT_THERMAL_MODELS
+        elif group_name == "flow":
+            models = config.OPENROUTER_AGENT_FLOW_MODELS
+        elif group_name == "fuel":
+            models = config.OPENROUTER_AGENT_FUEL_MODELS
+        elif group_name == "quality":
+            models = config.OPENROUTER_AGENT_QUALITY_MODELS
+        else:
+            models = config.OPENROUTER_AGENT_DEFAULT_MODELS
+        return ReasoningSynthesizer._curated_specialist_models(models)
+
+    @staticmethod
+    def _curated_specialist_models(models: list[str] | None) -> list[str]:
+        """Return free text/instruction models suitable for specialist JSON reasoning.
+
+        The generic openrouter/free router can select vision or small convenience
+        models that are unreliable for strict specialist JSON. For specialist
+        agents, keep only explicit text/instruct free models and remove broad
+        routers and obvious VL/vision models.
+        """
+        fallback = [
+            "google/gemma-3-27b-it:free",
+            "openai/gpt-oss-120b:free",
+            "minimax/minimax-m2.5:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+        ]
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for model in list(models or []) + fallback:
+            model = str(model).strip()
+            lowered = model.lower()
+            if not model or not lowered.endswith(":free"):
+                continue
+            if lowered == "openrouter/free" or "/free" == lowered:
+                continue
+            # Avoid vision-first/free router selections for JSON-only control reasoning.
+            if any(token in lowered for token in ["-vl", "vl:", "vision", "image"]):
+                continue
+            if lowered not in seen:
+                seen.add(lowered)
+                cleaned.append(model)
+        return cleaned[: max(1, config.OPENROUTER_MAX_MODEL_ATTEMPTS)] or fallback[:1]
 
     def _invoke_openrouter(
         self,
@@ -606,6 +642,10 @@ class ReasoningSynthesizer:
                 body["response_format"] = {"type": "json_schema", "json_schema": response_schema}
                 if config.OPENROUTER_USE_RESPONSE_HEALING:
                     body["plugins"] = [{"id": "response-healing"}]
+            elif str(prompt).lstrip().startswith("{"):
+                # Lightweight JSON mode. This is less restrictive than json_schema and
+                # works with more free text models, while still nudging valid JSON.
+                body["response_format"] = {"type": "json_object"}
 
         read_timeout = max(1.0, float(timeout_seconds if timeout_seconds is not None else config.OPENROUTER_TIMEOUT_SECONDS))
         connect_timeout = max(1.0, min(float(config.OPENROUTER_CONNECT_TIMEOUT_SECONDS), read_timeout))
@@ -847,7 +887,7 @@ class ReasoningSynthesizer:
             "monitoring_action": "non-control workflow instruction, or omit",
         }
         prompt = {
-            "task": "Act as the listed LLM-first specialist blast-furnace agents. Reason independently for each agent and return valid JSON only.",
+            "task": "Act as the listed LLM-first specialist blast-furnace agents. For EACH expected_agent_names item, diagnose the assigned area and return one JSON review. Output JSON only.",
             "common_agent_memory_version": "forgepilot_bf_operator_copilot_v2",
             "common_agent_memory": self._common_agent_memory(),
             "response_rules": [
@@ -880,11 +920,9 @@ class ReasoningSynthesizer:
             "similar_cases": context.similar_cases[:2],
             "examples": self._llm_first_examples(),
         }
-        # Do not slice the JSON prompt aggressively. Truncating JSON creates the exact
-        # failure mode seen in the UI: the model loses the operating context and returns
-        # generic placeholders. The payload is still compact and batched, so the shared
-        # memory is sent once per LLM review rather than once per specialist agent.
-        return json.dumps(prompt, default=str, separators=(",", ":"))
+        # Keep the request compact enough for free models to obey. The shared memory is
+        # concise, repeated once per group, and the response contract is explicit.
+        return json.dumps(prompt, default=str, separators=(",", ":"))[: max(config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT, 12000)]
 
     @staticmethod
     def _common_agent_memory() -> dict[str, Any]:
