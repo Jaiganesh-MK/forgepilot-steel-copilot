@@ -257,6 +257,11 @@ class AgentCoordinator:
 
     def _architecture_status(self, llm_agent_requested: bool = False) -> dict[str, Any]:
         status = self.synthesizer.status()
+        if config.OPENROUTER_INCLUDE_KEY_HEALTH_CHECK:
+            try:
+                status["openrouter_key_health"] = self.synthesizer.key_health()
+            except Exception as exc:
+                status["openrouter_key_health"] = {"ok": False, "error": str(exc)}
         status.update(
             {
                 "direct_setpoint_action_enabled": config.ALLOW_DIRECT_SETPOINT_ACTIONS,

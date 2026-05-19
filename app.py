@@ -349,7 +349,12 @@ def api_get(base_url: str, path: str, params: dict[str, Any] | None = None) -> d
             "openrouter_free_models": llm_status.get("openrouter_free_models", []),
         }
     if path == "/api/llm-status":
-        return coordinator.synthesizer.status()
+        status = coordinator.synthesizer.status()
+        try:
+            status["openrouter_key_health"] = coordinator.synthesizer.key_health()
+        except Exception as exc:
+            status["openrouter_key_health"] = {"ok": False, "error": str(exc)}
+        return status
     if path == "/api/metadata":
         return store.metadata_payload()
     if path == "/api/state":
@@ -1064,6 +1069,10 @@ with main_tab:
                 st.write(f"OpenRouter enabled: {arch_status.get('openrouter_reasoning_enabled')}")
                 st.write(f"Configured API keys: {arch_status.get('openrouter_api_key_count')}")
                 st.write(f"Configured free models: {', '.join(arch_status.get('openrouter_free_models') or [])}")
+                st.write(f"Reliability mode: {arch_status.get('openrouter_reliability_mode')}")
+                if arch_status.get("openrouter_key_health"):
+                    st.write("Key health:")
+                    st.json(arch_status.get("openrouter_key_health"))
                 if attempted_routes:
                     st.write("Attempted routes:")
                     for route in attempted_routes[:12]:

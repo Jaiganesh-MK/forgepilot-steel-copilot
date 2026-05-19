@@ -66,6 +66,8 @@ class ReasoningSynthesizer:
             "openrouter_use_structured_outputs": config.OPENROUTER_USE_STRUCTURED_OUTPUTS,
             "openrouter_agent_structured_outputs": config.OPENROUTER_AGENT_STRUCTURED_OUTPUTS,
             "openrouter_agent_routing_mode": config.OPENROUTER_AGENT_ROUTING_MODE,
+            "openrouter_reliability_mode": config.OPENROUTER_RELIABILITY_MODE,
+            "openrouter_accept_text_fallback": config.OPENROUTER_ACCEPT_TEXT_FALLBACK,
             "openrouter_agent_thermal_models": config.OPENROUTER_AGENT_THERMAL_MODELS,
             "openrouter_agent_flow_models": config.OPENROUTER_AGENT_FLOW_MODELS,
             "openrouter_agent_fuel_models": config.OPENROUTER_AGENT_FUEL_MODELS,
@@ -103,6 +105,20 @@ class ReasoningSynthesizer:
             "last_llm_error": self.last_error,
             "agent_review_stats": self.agent_review_stats,
         }
+
+    def key_health(self) -> dict[str, Any]:
+        if not self.api_keys:
+            return {"ok": False, "error": "No OpenRouter API key configured"}
+        url = f"{config.OPENROUTER_BASE_URL.rstrip('/')}/key"
+        key = self.api_keys[0]
+        try:
+            response = requests.get(url, headers=self._headers(key), timeout=(3, 8))
+            data = response.json() if response.text else {}
+            if response.status_code < 200 or response.status_code >= 300:
+                return {"ok": False, "status_code": response.status_code, "error": data}
+            return {"ok": True, "status_code": response.status_code, "data": data}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def deterministic_summary(self, payload: dict[str, Any]) -> str:
         return self._fallback_summary(payload)
@@ -188,6 +204,15 @@ class ReasoningSynthesizer:
         max_batch = max(1, int(config.LLM_AGENT_BATCH_SIZE))
         signals = signals[:max_batch]
 
+        if config.OPENROUTER_RELIABILITY_MODE == "simple_free_router" or config.OPENROUTER_AGENT_ROUTING_MODE == "simple_free_router":
+            return self._review_agent_signals_batch_core(
+                signals,
+                context,
+                timeout_seconds=timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
+                model_candidates=[config.OPENROUTER_FREE_ROUTER_MODEL],
+                group_name="simple_free_router",
+            )
+
         if config.OPENROUTER_AGENT_ROUTING_MODE == "grouped" and len(signals) > 1:
             return self._review_agent_signal_groups(signals, context, timeout_seconds=timeout_seconds)
 
@@ -257,10 +282,9 @@ class ReasoningSynthesizer:
 
         prompt = self._build_agent_batch_review_prompt(signals, context)
         system_prompt = (
-            "You are a compact panel of blast furnace specialist decision agents. "
-            "Review each deterministic specialist scaffold independently. "
-            "Return valid JSON only, with top-level key agent_reviews. "
-            "No markdown, no prose outside JSON, no invented measurements, and no automatic setpoint execution claims."
+            "You are a blast furnace operations review copilot. "
+            "Check deterministic specialist agent recommendations for consistency and safety. "
+            "Prefer concise JSON. Do not invent measurements or claim automatic execution."
         )
         response_schema = self._batch_agent_response_schema() if config.OPENROUTER_AGENT_STRUCTURED_OUTPUTS else None
         try:
@@ -274,10 +298,18 @@ class ReasoningSynthesizer:
                 total_timeout_seconds=timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
                 model_candidates_override=model_candidates,
             )
-            data = self._parse_json_response(result["text"])
-            reviews = data.get("agent_reviews", []) if isinstance(data, dict) else []
-            if not isinstance(reviews, list):
-                raise ValueError("Batch LLM response did not contain an agent_reviews list")
+            try:
+                data = self._parse_json_response(result["text"])
+                reviews = data.get("agent_reviews", []) if isinstance(data, dict) else []
+                if not isinstance(reviews, list):
+                    raise ValueError("Batch LLM response did not contain an agent_reviews list")
+            except Exception as parse_exc:
+                if not config.OPENROUTER_ACCEPT_TEXT_FALLBACK or not str(result.get("text", "")).strip():
+                    raise parse_exc
+                # Free models sometimes return useful text but not strict JSON.
+                # For a POC, treat this as a completed LLM review and preserve deterministic actions,
+                # adding the model's text as reasoning rather than failing all agents.
+                reviews = self._text_fallback_reviews(signals, str(result.get("text", "")))
             by_name = {str(item.get("agent_name")): item for item in reviews if isinstance(item, dict) and item.get("agent_name")}
             refined: list[AgentSignal] = []
             for signal in signals:
@@ -511,19 +543,26 @@ class ReasoningSynthesizer:
             "max_tokens": max_tokens,
             "stream": False,
         }
-        if config.OPENROUTER_NATIVE_MODEL_FALLBACKS and len(model_candidates) > 1:
+        simple_free_mode = config.OPENROUTER_RELIABILITY_MODE == "simple_free_router" and model_candidates == [config.OPENROUTER_FREE_ROUTER_MODEL]
+        if simple_free_mode:
+            # Most reliable free-model request shape: one model, no provider filters, no strict schema, no plugins.
+            # OpenRouter docs note that the free router filters by requested capabilities; keeping the
+            # request plain maximizes the eligible free-model pool.
+            body["model"] = config.OPENROUTER_FREE_ROUTER_MODEL
+        elif config.OPENROUTER_NATIVE_MODEL_FALLBACKS and len(model_candidates) > 1:
             body["models"] = model_candidates
         else:
             body["model"] = model_candidates[0]
 
-        provider = self._provider_preferences(response_schema=response_schema)
-        if provider:
-            body["provider"] = provider
+        if not simple_free_mode:
+            provider = self._provider_preferences(response_schema=response_schema)
+            if provider:
+                body["provider"] = provider
 
-        if response_schema is not None and config.OPENROUTER_USE_STRUCTURED_OUTPUTS:
-            body["response_format"] = {"type": "json_schema", "json_schema": response_schema}
-            if config.OPENROUTER_USE_RESPONSE_HEALING:
-                body["plugins"] = [{"id": "response-healing"}]
+            if response_schema is not None and config.OPENROUTER_USE_STRUCTURED_OUTPUTS:
+                body["response_format"] = {"type": "json_schema", "json_schema": response_schema}
+                if config.OPENROUTER_USE_RESPONSE_HEALING:
+                    body["plugins"] = [{"id": "response-healing"}]
 
         read_timeout = max(1.0, float(timeout_seconds if timeout_seconds is not None else config.OPENROUTER_TIMEOUT_SECONDS))
         connect_timeout = max(1.0, min(float(config.OPENROUTER_CONNECT_TIMEOUT_SECONDS), read_timeout))
@@ -547,7 +586,11 @@ class ReasoningSynthesizer:
             raise RuntimeError(f"OpenRouter error: {message}")
 
         try:
-            content = data["choices"][0]["message"].get("content", "")
+            first_choice = data["choices"][0]
+            if isinstance(first_choice, dict) and first_choice.get("error"):
+                err = first_choice.get("error")
+                raise RuntimeError(f"Model returned error choice: {err}")
+            content = first_choice["message"].get("content", "")
         except Exception as exc:
             raise RuntimeError(f"Unexpected response format: {data}") from exc
 
@@ -603,15 +646,53 @@ class ReasoningSynthesizer:
         return json.dumps(prompt, default=str)[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _build_agent_batch_review_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
-        prompt = self._agent_prompt_payload(signals, context)
-        prompt["task"] = (
-            "Review every specialist agent signal in deterministic_scaffolds. "
-            "Return exactly one agent_reviews entry per input agent_name. "
-            "The output must be valid compact JSON only: {\"agent_reviews\":[{\"agent_name\":...,\"severity\":\"low|medium|high|critical\",\"confidence\":0.0-1.0,\"message\":...,\"proposed_actions\":{},\"reasoning_addendum\":...,\"evidence_additions\":[],\"prerequisites\":[],\"risk_tags\":[]}]}"
-        )
-        # Batch prompts need room for all agents but should stay compact for free models.
-        limit = max(config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT, min(14000, config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT * 2))
-        return json.dumps(prompt, default=str)[:limit]
+        # Keep this deliberately small for OpenRouter free models. Full deterministic context stays local;
+        # the LLM only sanity-checks the selected low-confidence agents.
+        row = self._compact_state(context)
+        compact_state_keys = [
+            "timestamp", "event_label", "operating_mode", "plant_risk_level", "plant_risk_score",
+            "thermal_state_index", "permeability_index", "pressure_drop_kpa", "gas_utilization_pct",
+            "hot_metal_temp_c", "hot_metal_si_pct", "wind_volume_nm3_min", "pci_rate_kg_thm",
+            "coke_rate_kg_thm", "top_pressure_kpa", "oxygen_enrichment_pct", "hot_blast_temp_c",
+        ]
+        state = {k: row.get(k) for k in compact_state_keys if k in row}
+        scaffolds = []
+        for s in signals:
+            scaffolds.append({
+                "agent_name": s.agent_name,
+                "decision_area": s.decision_area,
+                "severity": s.severity,
+                "confidence": round(float(s.confidence), 3),
+                "message": s.message,
+                "proposed_actions": s.proposed_actions,
+                "evidence": s.evidence[:3],
+                "risk_tags": s.risk_tags[:5],
+            })
+        prompt = {
+            "task": "Review each selected specialist agent. Return compact JSON only with key agent_reviews. If uncertain, keep deterministic actions unchanged and lower confidence.",
+            "output_shape": {
+                "agent_reviews": [{
+                    "agent_name": "same as input",
+                    "severity": "low|medium|high|critical",
+                    "confidence": 0.0,
+                    "message": "short operator-facing message",
+                    "proposed_actions": {},
+                    "reasoning_addendum": "one sentence",
+                    "evidence_additions": [],
+                    "prerequisites": ["operator approval required for setpoint changes"],
+                    "risk_tags": []
+                }]
+            },
+            "rules": [
+                "Use only provided plant_state and scaffolds",
+                "Do not claim automatic execution",
+                "Do not invent measurements",
+                "Keep proposed_actions within the scaffold unless there is a clear safety reason to remove/soften them",
+            ],
+            "plant_state": state,
+            "deterministic_scaffolds": scaffolds,
+        }
+        return json.dumps(prompt, default=str, separators=(",", ":"))[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _agent_prompt_payload(self, signals: list[AgentSignal], context: PlantContext) -> dict[str, Any]:
         allowed_actions = {
@@ -645,6 +726,24 @@ class ReasoningSynthesizer:
                 "risk_tags",
             ],
         }
+
+    @staticmethod
+    def _text_fallback_reviews(signals: list[AgentSignal], text: str) -> list[dict[str, Any]]:
+        short_text = " ".join(str(text).strip().split())[:800]
+        reviews: list[dict[str, Any]] = []
+        for signal in signals:
+            reviews.append({
+                "agent_name": signal.agent_name,
+                "severity": signal.severity,
+                "confidence": max(0.0, min(1.0, float(signal.confidence))),
+                "message": signal.message,
+                "proposed_actions": signal.proposed_actions,
+                "reasoning_addendum": f"OpenRouter returned a non-JSON review; deterministic scaffold retained. Model note: {short_text}",
+                "evidence_additions": [],
+                "prerequisites": signal.prerequisites or ["Operator approval required for setpoint changes"],
+                "risk_tags": signal.risk_tags,
+            })
+        return reviews
 
     @staticmethod
     def _single_agent_response_schema() -> dict[str, Any]:

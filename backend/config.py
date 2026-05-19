@@ -18,6 +18,27 @@ if load_dotenv:
     load_dotenv(BASE_DIR / ".env")
 
 
+def _load_streamlit_secrets_into_env() -> None:
+    """Expose Streamlit Cloud secrets as env vars for backend modules.
+
+    Streamlit Cloud keeps secrets in st.secrets. In many deployments top-level
+    TOML keys are also reflected as environment variables, but this helper makes
+    the behavior explicit and avoids silent OpenRouter misconfiguration.
+    """
+    try:
+        import streamlit as st  # type: ignore
+        secrets = getattr(st, "secrets", {})
+        if not secrets:
+            return
+        for key, value in secrets.items():
+            if key not in os.environ and isinstance(value, (str, int, float, bool)):
+                os.environ[key] = str(value)
+    except Exception:
+        return
+
+_load_streamlit_secrets_into_env()
+
+
 def _as_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
@@ -133,8 +154,8 @@ OPENROUTER_USE_RESPONSE_HEALING = _as_bool(os.getenv("OPENROUTER_USE_RESPONSE_HE
 # JSON is often more reliable while still being parsed and validated locally.
 OPENROUTER_AGENT_STRUCTURED_OUTPUTS = _as_bool(os.getenv("OPENROUTER_AGENT_STRUCTURED_OUTPUTS", "false"), False)
 OPENROUTER_AGENT_ROUTING_MODE = os.getenv("OPENROUTER_AGENT_ROUTING_MODE", "grouped").strip().lower()
-if OPENROUTER_AGENT_ROUTING_MODE not in {"single_batch", "grouped", "single_agent"}:
-    OPENROUTER_AGENT_ROUTING_MODE = "grouped"
+if OPENROUTER_AGENT_ROUTING_MODE not in {"simple_free_router", "single_batch", "grouped", "single_agent"}:
+    OPENROUTER_AGENT_ROUTING_MODE = "simple_free_router"
 
 def _free_model_list(value: str | None, default: list[str]) -> list[str]:
     parsed = _parse_list(value) if value else default.copy()
@@ -177,7 +198,12 @@ OPENROUTER_TIMEOUT_SECONDS = _as_float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", o
 OPENROUTER_TOTAL_TIMEOUT_SECONDS = _as_float(os.getenv("OPENROUTER_TOTAL_TIMEOUT_SECONDS"), 25.0)
 OPENROUTER_MAX_TOKENS = _as_int(os.getenv("OPENROUTER_MAX_TOKENS"), 350)
 OPENROUTER_AGENT_MAX_TOKENS = _as_int(os.getenv("OPENROUTER_AGENT_MAX_TOKENS"), 900)
-OPENROUTER_AGENT_BATCH_MAX_TOKENS = _as_int(os.getenv("OPENROUTER_AGENT_BATCH_MAX_TOKENS"), 1400)
+OPENROUTER_AGENT_BATCH_MAX_TOKENS = _as_int(os.getenv("OPENROUTER_AGENT_BATCH_MAX_TOKENS"), 900)
+OPENROUTER_RELIABILITY_MODE = os.getenv("OPENROUTER_RELIABILITY_MODE", "simple_free_router").strip().lower()
+if OPENROUTER_RELIABILITY_MODE not in {"simple_free_router", "advanced"}:
+    OPENROUTER_RELIABILITY_MODE = "simple_free_router"
+OPENROUTER_ACCEPT_TEXT_FALLBACK = _as_bool(os.getenv("OPENROUTER_ACCEPT_TEXT_FALLBACK", "true"), True)
+OPENROUTER_INCLUDE_KEY_HEALTH_CHECK = _as_bool(os.getenv("OPENROUTER_INCLUDE_KEY_HEALTH_CHECK", "true"), True)
 OPENROUTER_TEMPERATURE = _as_float(os.getenv("OPENROUTER_TEMPERATURE"), 0.15)
 OPENROUTER_AGENT_TEMPERATURE = _as_float(os.getenv("OPENROUTER_AGENT_TEMPERATURE"), 0.05)
 OPENROUTER_PROMPT_CHAR_LIMIT = _as_int(os.getenv("OPENROUTER_PROMPT_CHAR_LIMIT"), 8000)
