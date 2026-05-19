@@ -1135,6 +1135,12 @@ with main_tab:
                 st.write(f"Configured API keys: {arch_status.get('openrouter_api_key_count')}")
                 st.write(f"Configured free models: {', '.join(arch_status.get('openrouter_free_models') or [])}")
                 st.write(f"Reliability mode: {arch_status.get('openrouter_reliability_mode')}")
+                kb_status = arch_status.get("knowledge_base") or {}
+                if kb_status:
+                    st.write(f"RAG knowledge base: enabled={kb_status.get('rag_enabled')} | chunks={kb_status.get('rag_chunk_count')} | top_k={kb_status.get('rag_top_k')}")
+                    sources = kb_status.get("rag_sources") or []
+                    if sources:
+                        st.write(f"Knowledge sources: {', '.join(sources[:8])}")
                 if arch_status.get("openrouter_key_health"):
                     st.write("Key health:")
                     st.json(arch_status.get("openrouter_key_health"))

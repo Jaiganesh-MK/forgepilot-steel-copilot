@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from . import config
+from . import knowledge_base
 from .agent_core import AgentSignal, PlantContext, clamp, safe_float
 
 
@@ -77,6 +78,7 @@ class ReasoningSynthesizer:
             "openrouter_free_models": self.models,
             "free_model_pool": self.models,
             "openrouter_rejected_non_free_models": config.OPENROUTER_REJECTED_NON_FREE_MODELS,
+            "knowledge_base": knowledge_base.status(),
             "openrouter_api_key_count": len(self.api_keys),
             "openrouter_redacted_api_keys": [self._redact_key(key) for key in self.api_keys],
             "openrouter_max_model_attempts": config.OPENROUTER_MAX_MODEL_ATTEMPTS,
@@ -886,6 +888,9 @@ class ReasoningSynthesizer:
             "tapping_priority": "Normal / Expedite / Delay, or omit",
             "monitoring_action": "non-control workflow instruction, or omit",
         }
+        plant_state = self._compact_state(context)
+        recent_trends = self._compact_trends(context)
+        retrieved_knowledge = knowledge_base.retrieve_for_agents(agent_requests, plant_state, recent_trends)
         prompt = {
             "task": "Act as the listed LLM-first specialist blast-furnace agents. For EACH expected_agent_names item, diagnose the assigned area and return one JSON review. Output JSON only.",
             "common_agent_memory_version": "forgepilot_bf_operator_copilot_v2",
@@ -895,7 +900,7 @@ class ReasoningSynthesizer:
                 "The response must be a JSON object with key agent_reviews.",
                 "Return exactly one review per expected_agent_names entry.",
                 "Each review.agent_name must exactly match one expected_agent_names value.",
-                "Use only the supplied plant_state, recent_trends, similar_cases, common_agent_memory, agent_playbooks, and allowed_actions.",
+                "Use only the supplied plant_state, recent_trends, similar_cases, common_agent_memory, agent_playbooks, retrieved_knowledge_by_agent, and allowed_actions.",
                 "Do not invent measurements, targets, causes, or plant events.",
                 "Do not say 'no setpoint action proposed' when the agent playbook thresholds clearly indicate a corrective advisory.",
                 "All setpoint changes are recommendations requiring operator approval; never claim automatic execution.",
@@ -914,9 +919,16 @@ class ReasoningSynthesizer:
             },
             "expected_agent_names": expected_names,
             "agent_playbooks": agent_requests,
+            "retrieved_knowledge_by_agent": retrieved_knowledge,
+            "knowledge_use_rules": [
+                "Use retrieved_knowledge_by_agent as the domain playbook/evidence base for each specialist.",
+                "When recommending an action, tie reasoning to both plant_state values and the most relevant retrieved snippet titles.",
+                "If retrieved knowledge conflicts with plant_state or safety constraints, prioritize plant_state and safety constraints.",
+                "Do not quote long passages; summarize the relevant principle in the specialist reasoning_addendum.",
+            ],
             "allowed_actions": allowed_actions,
-            "plant_state": self._compact_state(context),
-            "recent_trends": self._compact_trends(context),
+            "plant_state": plant_state,
+            "recent_trends": recent_trends,
             "similar_cases": context.similar_cases[:2],
             "examples": self._llm_first_examples(),
         }
@@ -1138,6 +1150,17 @@ class ReasoningSynthesizer:
             "tapping_priority": "Normal / Expedite / Delay, or omit",
             "monitoring_action": "non-control workflow instruction, or omit",
         }
+        plant_state = self._compact_state(context)
+        recent_trends = self._compact_trends(context)
+        agent_requests = [
+            {
+                "agent_name": signal.agent_name,
+                "decision_area": signal.decision_area,
+                "playbook": ReasoningSynthesizer._agent_playbooks().get(signal.agent_name, ReasoningSynthesizer._agent_playbooks()["DefaultAgent"]),
+            }
+            for signal in signals
+        ]
+        retrieved_knowledge = knowledge_base.retrieve_for_agents(agent_requests, plant_state, recent_trends)
         return {
             "hard_constraints": [
                 "Return valid JSON only. No markdown.",
@@ -1147,9 +1170,10 @@ class ReasoningSynthesizer:
                 "Never state that an action is executed automatically. All setpoint changes are recommendations for operator approval.",
             ],
             "allowed_actions": allowed_actions,
-            "plant_state": self._compact_state(context),
-            "recent_trends": self._compact_trends(context),
+            "plant_state": plant_state,
+            "recent_trends": recent_trends,
             "similar_cases": context.similar_cases[:2],
+            "retrieved_knowledge_by_agent": retrieved_knowledge,
             "deterministic_scaffolds": [signal.to_dict() for signal in signals],
             "required_review_fields": [
                 "agent_name",
@@ -1309,7 +1333,7 @@ class ReasoningSynthesizer:
             }
         )
         if self._metadata_is_llm_first_mode(original_metadata):
-            original_metadata["deterministic_scaffold_text"] = "Not used in LLM-first mode. The LLM specialist reasoned from plant state, shared operating memory, agent playbook, trends, similar cases, and allowed action bounds; deterministic logic only validates/falls back."
+            original_metadata["deterministic_scaffold_text"] = "Not used in LLM-first mode. The LLM specialist reasoned from plant state, shared operating memory, agent playbook, retrieved knowledge snippets, trends, similar cases, and allowed action bounds; deterministic logic only validates/falls back."
 
         original_severity = str(signal.severity or "low").lower()
         requested_severity = str(data.get("severity") or original_severity).lower()

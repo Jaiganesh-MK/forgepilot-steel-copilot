@@ -281,3 +281,14 @@ TARGETS = {
     "thermal_state_index": (-0.65, 0.65),
     "hearth_liquid_level_index": (35.0, 78.0),
 }
+
+# Retrieval-augmented generation (RAG) knowledge base for LLM-first agents.
+# Uses local Markdown files and a lightweight keyword/TF-IDF retriever so the
+# Streamlit deployment does not need an external vector database.
+KNOWLEDGE_BASE_DIR = Path(os.getenv("KNOWLEDGE_BASE_DIR", str(BASE_DIR / "knowledge_base")))
+RAG_ENABLED = _as_bool(os.getenv("RAG_ENABLED", "true"), True)
+RAG_TOP_K = max(0, _as_int(os.getenv("RAG_TOP_K"), 4))
+RAG_MAX_SNIPPET_CHARS = max(300, _as_int(os.getenv("RAG_MAX_SNIPPET_CHARS"), 900))
+RAG_CHUNK_MAX_WORDS = max(80, _as_int(os.getenv("RAG_CHUNK_MAX_WORDS"), 220))
+RAG_CHUNK_OVERLAP_WORDS = max(0, _as_int(os.getenv("RAG_CHUNK_OVERLAP_WORDS"), 35))
+RAG_REQUIRE_SOURCE_AWARE_REASONING = _as_bool(os.getenv("RAG_REQUIRE_SOURCE_AWARE_REASONING", "true"), True)
