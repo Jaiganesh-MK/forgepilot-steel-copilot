@@ -242,6 +242,39 @@ def _truthy(value: Any) -> bool:
 
 
 
+
+def clean_operator_text(value: Any) -> str:
+    """Prevent raw LLM JSON/code-fence output from leaking into the operator UI."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    markers = [
+        "OpenRouter returned a non-JSON review",
+        "Model note:",
+        "```json",
+        "{ \"agent_reviews\"",
+        "agent_reviews",
+    ]
+    if any(marker in text for marker in markers):
+        prefix = text.split("OpenRouter returned a non-JSON review", 1)[0].strip()
+        prefix = prefix.split("Model note:", 1)[0].strip()
+        if prefix:
+            return prefix + " OpenRouter review was received but could not be mapped cleanly; deterministic scaffold retained."
+        return "OpenRouter review was received but could not be mapped cleanly; deterministic scaffold retained."
+    return text
+
+
+def clean_records_for_display(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for row in records:
+        new_row = dict(row)
+        for key in ["message", "content", "llm_error", "reasoning_addendum"]:
+            if key in new_row:
+                new_row[key] = clean_operator_text(new_row.get(key))
+        cleaned.append(new_row)
+    return cleaned
+
+
 @dataclass
 class EmbeddedRuntime:
     store: DataStore
@@ -697,7 +730,7 @@ def render_agent_flow_figure(messages: list[dict[str, Any]], signals: list[dict[
         key = (src, tgt)
         conf = max(0.05, min(float(msg.get("confidence") or 0.2), 1.0))
         if key not in edge_map or conf > edge_map[key]["confidence"]:
-            edge_map[key] = {"confidence": conf, "content": str(msg.get("content") or ""), "message_type": str(msg.get("message_type") or "message")}
+            edge_map[key] = {"confidence": conf, "content": clean_operator_text(msg.get("content")), "message_type": str(msg.get("message_type") or "message")}
         else:
             edge_map[key]["content"] = edge_map[key]["content"]
     active_edges = list(edge_map.items())[:18]
@@ -832,7 +865,7 @@ def render_message_cards(messages: list[dict[str, Any]], limit: int = 12) -> Non
         src = AGENT_SHORT_NAMES.get(str(msg.get("from_agent")), str(msg.get("from_agent") or "-"))
         tgt = AGENT_SHORT_NAMES.get(str(msg.get("to_agent")), str(msg.get("to_agent") or "-"))
         message_type = escape(str(msg.get("message_type") or "message"))
-        content = escape(str(msg.get("content") or ""))
+        content = escape(clean_operator_text(msg.get("content")))
         conf = max(0.0, min(float(msg.get("confidence") or 0.0), 1.0))
         cards.append(
             dedent(
@@ -1082,7 +1115,7 @@ with main_tab:
                 reviews = recommendation_payload.get("llm_agent_reviews") or []
                 if reviews:
                     st.write("Per-agent LLM review status:")
-                    st.dataframe(pd.DataFrame(reviews), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(clean_records_for_display(reviews)), use_container_width=True, hide_index=True)
     st.info(recommendation_payload.get("executive_summary", "No summary generated."))
 
     st.markdown("#### Recommendations requiring operator attention")
@@ -1154,17 +1187,23 @@ with agents_tab:
     reviews = recommendation_payload.get("llm_agent_reviews", [])
     if reviews:
         st.markdown("#### OpenRouter specialist-agent reviews")
-        st.dataframe(pd.DataFrame(reviews), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(clean_records_for_display(reviews)), use_container_width=True, hide_index=True)
 
     signals_df = pd.DataFrame(signals)
     if not signals_df.empty:
         st.markdown("#### Agent signals")
         display_cols = ["agent_name", "decision_area", "severity", "confidence", "message", "proposed_actions", "risk_tags"]
-        st.dataframe(signals_df[[c for c in display_cols if c in signals_df.columns]], use_container_width=True, hide_index=True)
+        signals_display = signals_df[[c for c in display_cols if c in signals_df.columns]].copy()
+        if "message" in signals_display.columns:
+            signals_display["message"] = signals_display["message"].apply(clean_operator_text)
+        st.dataframe(signals_display, use_container_width=True, hide_index=True)
     messages_df = pd.DataFrame(messages)
     if not messages_df.empty:
         st.markdown("#### Inter-agent messages table")
-        st.dataframe(messages_df, use_container_width=True, hide_index=True)
+        messages_display = messages_df.copy()
+        if "content" in messages_display.columns:
+            messages_display["content"] = messages_display["content"].apply(clean_operator_text)
+        st.dataframe(messages_display, use_container_width=True, hide_index=True)
         agents = sorted(set(messages_df["from_agent"].astype(str)).union(set(messages_df["to_agent"].astype(str))))
         agent_index = {agent: i for i, agent in enumerate(agents)}
         link_conf = [max(float(v), 0.1) for v in messages_df["confidence"]]

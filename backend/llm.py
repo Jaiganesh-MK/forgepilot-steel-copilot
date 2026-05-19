@@ -310,12 +310,25 @@ class ReasoningSynthesizer:
                 # For a POC, treat this as a completed LLM review and preserve deterministic actions,
                 # adding the model's text as reasoning rather than failing all agents.
                 reviews = self._text_fallback_reviews(signals, str(result.get("text", "")))
-            by_name = {str(item.get("agent_name")): item for item in reviews if isinstance(item, dict) and item.get("agent_name")}
+            by_name: dict[str, dict[str, Any]] = {}
+            placeholders = {"same as input", "input", "agent_name", "same_as_input", ""}
+            for item in reviews:
+                if not isinstance(item, dict):
+                    continue
+                raw_name = str(item.get("agent_name") or "").strip()
+                if raw_name.lower() in placeholders:
+                    continue
+                by_name[raw_name] = item
+
+            # If a single-agent call returned a placeholder name, map it to that agent.
+            if len(signals) == 1 and not by_name and reviews and isinstance(reviews[0], dict):
+                by_name[signals[0].agent_name] = reviews[0]
+
             refined: list[AgentSignal] = []
             for signal in signals:
                 review = by_name.get(signal.agent_name)
                 if review is None:
-                    error = "Batch response missing this agent; deterministic scaffold retained."
+                    error = "OpenRouter response did not include a valid review for this specialist; deterministic scaffold retained."
                     refined_signal = self._mark_signal_llm_fallback(signal, error)
                     self.agent_review_stats["failed"] = int(self.agent_review_stats.get("failed", 0)) + 1
                     self._record_agent_review(signal.agent_name, False, result.get("model"), error)
@@ -670,19 +683,11 @@ class ReasoningSynthesizer:
             })
         prompt = {
             "task": "Review each selected specialist agent. Return compact JSON only with key agent_reviews. If uncertain, keep deterministic actions unchanged and lower confidence.",
-            "output_shape": {
-                "agent_reviews": [{
-                    "agent_name": "same as input",
-                    "severity": "low|medium|high|critical",
-                    "confidence": 0.0,
-                    "message": "short operator-facing message",
-                    "proposed_actions": {},
-                    "reasoning_addendum": "one sentence",
-                    "evidence_additions": [],
-                    "prerequisites": ["operator approval required for setpoint changes"],
-                    "risk_tags": []
-                }]
-            },
+            "output_contract": "Return an object with key agent_reviews. Each item must use the exact agent_name from deterministic_scaffolds; never write placeholder values.",
+            "required_review_fields": [
+                "agent_name", "severity", "confidence", "message", "proposed_actions",
+                "reasoning_addendum", "evidence_additions", "prerequisites", "risk_tags"
+            ],
             "rules": [
                 "Use only provided plant_state and scaffolds",
                 "Do not claim automatic execution",
@@ -729,7 +734,8 @@ class ReasoningSynthesizer:
 
     @staticmethod
     def _text_fallback_reviews(signals: list[AgentSignal], text: str) -> list[dict[str, Any]]:
-        short_text = " ".join(str(text).strip().split())[:800]
+        # Free models sometimes return commentary or malformed JSON. Never surface raw model
+        # output in operator cards; keep a concise, safe note and retain the deterministic scaffold.
         reviews: list[dict[str, Any]] = []
         for signal in signals:
             reviews.append({
@@ -738,10 +744,11 @@ class ReasoningSynthesizer:
                 "confidence": max(0.0, min(1.0, float(signal.confidence))),
                 "message": signal.message,
                 "proposed_actions": signal.proposed_actions,
-                "reasoning_addendum": f"OpenRouter returned a non-JSON review; deterministic scaffold retained. Model note: {short_text}",
+                "reasoning_addendum": "OpenRouter review could not be parsed into the required specialist JSON; deterministic scaffold retained.",
                 "evidence_additions": [],
                 "prerequisites": signal.prerequisites or ["Operator approval required for setpoint changes"],
                 "risk_tags": signal.risk_tags,
+                "raw_model_output_redacted": True,
             })
         return reviews
 
@@ -933,19 +940,48 @@ class ReasoningSynthesizer:
 
     @staticmethod
     def _parse_json_response(text: str) -> dict[str, Any]:
-        stripped = text.strip()
+        stripped = str(text or "").strip()
+        candidates: list[str] = []
+
+        # Common OpenRouter/free-model case: ```json { ... } ```
         if stripped.startswith("```"):
-            stripped = stripped.strip("`")
-            if stripped.lower().startswith("json"):
-                stripped = stripped[4:].strip()
+            lines = stripped.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            fenced = "\n".join(lines).strip()
+            if fenced.lower().startswith("json"):
+                fenced = fenced[4:].strip()
+            if fenced:
+                candidates.append(fenced)
+
+        # Some models return a leading language token without backticks: json { ... }
+        lowered = stripped.lower()
+        if lowered.startswith("json"):
+            candidates.append(stripped[4:].strip())
+
+        candidates.append(stripped)
+
+        # Finally, try extracting the first balanced JSON object from any wrapper text.
         try:
-            parsed = json.loads(stripped)
+            candidates.append(ReasoningSynthesizer._extract_first_json_object(stripped))
         except Exception:
-            candidate = ReasoningSynthesizer._extract_first_json_object(stripped)
-            parsed = json.loads(candidate)
-        if not isinstance(parsed, dict):
-            raise ValueError("LLM response was not a JSON object")
-        return parsed
+            pass
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+                if not isinstance(parsed, dict):
+                    raise ValueError("LLM response was not a JSON object")
+                return parsed
+            except Exception as exc:
+                last_error = exc
+                continue
+        raise ValueError(f"Could not parse LLM response as JSON: {last_error}")
 
     @staticmethod
     def _extract_first_json_object(text: str) -> str:
