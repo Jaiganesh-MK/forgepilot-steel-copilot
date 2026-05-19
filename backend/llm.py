@@ -312,6 +312,7 @@ class ReasoningSynthesizer:
                 # adding the model's text as reasoning rather than failing all agents.
                 reviews = self._text_fallback_reviews(signals, str(result.get("text", "")))
             by_name: dict[str, dict[str, Any]] = {}
+            by_norm: dict[str, dict[str, Any]] = {}
             placeholders = {"same as input", "input", "agent_name", "same_as_input", ""}
             for item in reviews:
                 if not isinstance(item, dict):
@@ -320,14 +321,24 @@ class ReasoningSynthesizer:
                 if raw_name.lower() in placeholders:
                     continue
                 by_name[raw_name] = item
+                by_norm[self._normalize_name(raw_name)] = item
+
+            # If names are imperfect but the model returned the same number of review
+            # objects, map them positionally. This is safer than discarding every review.
+            valid_review_items = [item for item in reviews if isinstance(item, dict)]
+            if len(valid_review_items) == len(signals) and len(by_name) < len(signals):
+                for signal, item in zip(signals, valid_review_items):
+                    by_name.setdefault(signal.agent_name, item)
+                    by_norm.setdefault(self._normalize_name(signal.agent_name), item)
 
             # If a single-agent call returned a placeholder name, map it to that agent.
             if len(signals) == 1 and not by_name and reviews and isinstance(reviews[0], dict):
                 by_name[signals[0].agent_name] = reviews[0]
+                by_norm[self._normalize_name(signals[0].agent_name)] = reviews[0]
 
             refined: list[AgentSignal] = []
             for signal in signals:
-                review = by_name.get(signal.agent_name)
+                review = by_name.get(signal.agent_name) or by_norm.get(self._normalize_name(signal.agent_name))
                 if review is None:
                     error = "OpenRouter response did not include a valid review for this specialist; deterministic scaffold retained."
                     refined_signal = self._mark_signal_llm_fallback(signal, error)
@@ -735,14 +746,13 @@ class ReasoningSynthesizer:
         return json.dumps(prompt, default=str)[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _build_agent_batch_review_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
-        # Keep this deliberately small for OpenRouter free models. Full deterministic context stays local;
-        # the LLM only sanity-checks the selected low-confidence agents.
         row = self._compact_state(context)
         compact_state_keys = [
             "timestamp", "event_label", "operating_mode", "plant_risk_level", "plant_risk_score",
             "thermal_state_index", "permeability_index", "pressure_drop_kpa", "gas_utilization_pct",
             "hot_metal_temp_c", "hot_metal_si_pct", "wind_volume_nm3_min", "pci_rate_kg_thm",
             "coke_rate_kg_thm", "top_pressure_kpa", "oxygen_enrichment_pct", "hot_blast_temp_c",
+            "predicted_hot_metal_temp_4h_c", "predicted_si_4h_pct",
         ]
         state = {k: row.get(k) for k in compact_state_keys if k in row}
         scaffolds = []
@@ -757,19 +767,33 @@ class ReasoningSynthesizer:
                 "evidence": s.evidence[:3],
                 "risk_tags": s.risk_tags[:5],
             })
+
+        # Keep this prompt deliberately small. Free OpenRouter models frequently fail
+        # when asked for long, strict-schema, all-field JSON. We ask for a minimal
+        # object and the local merger fills missing optional fields safely.
         prompt = {
-            "task": "Review each selected specialist agent. Return compact JSON only with key agent_reviews. If uncertain, keep deterministic actions unchanged and lower confidence.",
-            "output_contract": "Return an object with key agent_reviews. Each item must use the exact agent_name from deterministic_scaffolds; never write placeholder values.",
-            "required_review_fields": [
-                "agent_name", "severity", "confidence", "message", "proposed_actions",
-                "reasoning_addendum", "evidence_additions", "prerequisites", "risk_tags"
+            "task": "Review every selected blast-furnace specialist agent and return valid JSON only.",
+            "critical_rules": [
+                "Return JSON only. Do not use markdown fences.",
+                "The response must be a JSON object with key agent_reviews.",
+                "Return exactly one review per expected_agent_names entry.",
+                "Each review.agent_name must exactly match one expected_agent_names value.",
+                "Do not return placeholders such as 'same as input'.",
+                "Use only the provided plant_state and deterministic_scaffolds; do not invent measurements.",
+                "Never claim automatic execution. Setpoint changes remain operator recommendations.",
             ],
-            "rules": [
-                "Use only provided plant_state and scaffolds",
-                "Do not claim automatic execution",
-                "Do not invent measurements",
-                "Keep proposed_actions within the scaffold unless there is a clear safety reason to remove/soften them",
-            ],
+            "review_item_shape": {
+                "agent_name": "exact name from expected_agent_names",
+                "severity": "low|medium|high|critical",
+                "confidence": "0.05 to 0.98",
+                "message": "one short operator-facing recommendation",
+                "proposed_actions": "object; keep deterministic actions unless unsafe",
+                "reasoning_addendum": "one short reason using plant numbers",
+                "evidence_additions": "array of short strings",
+                "prerequisites": "array of checks/approvals",
+                "risk_tags": "array of short tags",
+            },
+            "expected_agent_names": [s.agent_name for s in signals],
             "plant_state": state,
             "deterministic_scaffolds": scaffolds,
         }
@@ -809,9 +833,11 @@ class ReasoningSynthesizer:
         }
 
     @staticmethod
+    @staticmethod
     def _text_fallback_reviews(signals: list[AgentSignal], text: str) -> list[dict[str, Any]]:
-        # Free models sometimes return commentary or malformed JSON. Never surface raw model
-        # output in operator cards; keep a concise, safe note and retain the deterministic scaffold.
+        # Free models sometimes return commentary or malformed JSON. Do not surface
+        # raw model output in operator cards. Treat this as an LLM contact, but keep
+        # the deterministic scaffold clean and unchanged.
         reviews: list[dict[str, Any]] = []
         for signal in signals:
             reviews.append({
@@ -820,8 +846,8 @@ class ReasoningSynthesizer:
                 "confidence": max(0.0, min(1.0, float(signal.confidence))),
                 "message": signal.message,
                 "proposed_actions": signal.proposed_actions,
-                "reasoning_addendum": "OpenRouter review could not be parsed into the required specialist JSON; deterministic scaffold retained.",
-                "evidence_additions": [],
+                "reasoning_addendum": "",
+                "evidence_additions": ["OpenRouter returned an unstructured review; deterministic recommendation retained."],
                 "prerequisites": signal.prerequisites or ["Operator approval required for setpoint changes"],
                 "risk_tags": signal.risk_tags,
                 "raw_model_output_redacted": True,
@@ -1016,48 +1042,102 @@ class ReasoningSynthesizer:
 
     @staticmethod
     def _parse_json_response(text: str) -> dict[str, Any]:
-        stripped = str(text or "").strip()
+        raw = str(text or "").strip()
+        stripped = ReasoningSynthesizer._strip_markdown_code_fences(raw)
         candidates: list[str] = []
 
-        # Common OpenRouter/free-model case: ```json { ... } ```
-        if stripped.startswith("```"):
-            lines = stripped.splitlines()
-            if lines and lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            fenced = "\n".join(lines).strip()
-            if fenced.lower().startswith("json"):
-                fenced = fenced[4:].strip()
-            if fenced:
-                candidates.append(fenced)
+        for value in [stripped, raw]:
+            value = value.strip()
+            if not value:
+                continue
+            candidates.append(value)
+            lower = value.lower()
+            if lower.startswith("json"):
+                candidates.append(value[4:].strip())
+            try:
+                candidates.append(ReasoningSynthesizer._extract_first_json_object(value))
+            except Exception:
+                pass
+            try:
+                candidates.append(ReasoningSynthesizer._extract_first_json_array(value))
+            except Exception:
+                pass
 
-        # Some models return a leading language token without backticks: json { ... }
-        lowered = stripped.lower()
-        if lowered.startswith("json"):
-            candidates.append(stripped[4:].strip())
-
-        candidates.append(stripped)
-
-        # Finally, try extracting the first balanced JSON object from any wrapper text.
-        try:
-            candidates.append(ReasoningSynthesizer._extract_first_json_object(stripped))
-        except Exception:
-            pass
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        unique_candidates: list[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
 
         last_error: Exception | None = None
-        for candidate in candidates:
-            if not candidate:
-                continue
+        for candidate in unique_candidates:
             try:
                 parsed = json.loads(candidate)
-                if not isinstance(parsed, dict):
-                    raise ValueError("LLM response was not a JSON object")
-                return parsed
+                if isinstance(parsed, dict):
+                    return parsed
+                if isinstance(parsed, list):
+                    return {"agent_reviews": parsed}
+                raise ValueError("LLM response was not a JSON object or array")
             except Exception as exc:
                 last_error = exc
                 continue
         raise ValueError(f"Could not parse LLM response as JSON: {last_error}")
+
+    @staticmethod
+    def _strip_markdown_code_fences(text: str) -> str:
+        value = str(text or "").strip()
+        if "```" not in value:
+            return value
+        # Prefer the content inside the first fenced block, wherever it occurs.
+        parts = value.split("```")
+        if len(parts) >= 3:
+            block = parts[1].strip()
+            if block.lower().startswith("json"):
+                block = block[4:].strip()
+            return block
+        return value.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+    @staticmethod
+    def _extract_first_json_array(text: str) -> str:
+        # Prefer an array following the agent_reviews key if present.
+        marker = '"agent_reviews"'
+        start_search = 0
+        marker_index = text.find(marker)
+        if marker_index >= 0:
+            bracket = text.find("[", marker_index)
+            if bracket >= 0:
+                start_search = bracket
+        start = text.find("[", start_search)
+        if start < 0:
+            raise ValueError("No JSON array found in LLM response")
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape_next:
+                    escape_next = False
+                elif ch == "\\":
+                    escape_next = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        raise ValueError("Unterminated JSON array in LLM response")
+
+    @staticmethod
+    def _normalize_name(value: str) -> str:
+        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
     @staticmethod
     def _extract_first_json_object(text: str) -> str:
