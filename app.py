@@ -268,7 +268,7 @@ def clean_records_for_display(records: list[dict[str, Any]]) -> list[dict[str, A
     cleaned: list[dict[str, Any]] = []
     for row in records:
         new_row = dict(row)
-        for key in ["message", "content", "llm_error", "reasoning_addendum"]:
+        for key in ["message", "content", "llm_error", "reasoning_addendum", "deterministic_scaffold", "llm_message"]:
             if key in new_row:
                 new_row[key] = clean_operator_text(new_row.get(key))
         cleaned.append(new_row)
@@ -1199,7 +1199,22 @@ with agents_tab:
     reviews = recommendation_payload.get("llm_agent_reviews", [])
     if reviews:
         st.markdown("#### OpenRouter specialist-agent reviews")
-        st.dataframe(pd.DataFrame(clean_records_for_display(reviews)), use_container_width=True, hide_index=True)
+        reviews_df = pd.DataFrame(clean_records_for_display(reviews))
+        preferred_cols = [
+            "agent_name",
+            "decision_area",
+            "deterministic_confidence",
+            "deterministic_scaffold",
+            "llm_used",
+            "llm_model",
+            "llm_message",
+            "reasoning_addendum",
+            "llm_proposed_actions",
+            "decision_basis",
+            "llm_error",
+        ]
+        review_cols = [c for c in preferred_cols if c in reviews_df.columns] + [c for c in reviews_df.columns if c not in preferred_cols]
+        st.dataframe(reviews_df[review_cols], use_container_width=True, hide_index=True)
 
     signals_df = pd.DataFrame(signals)
     if not signals_df.empty:

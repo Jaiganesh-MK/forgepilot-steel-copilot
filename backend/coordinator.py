@@ -640,19 +640,35 @@ class AgentCoordinator:
         for signal in signals:
             metadata = signal.metadata or {}
             if metadata.get("llm_review_requested") or metadata.get("llm_used") or metadata.get("llm_error"):
+                actions = signal.proposed_actions or {}
+                evidence = signal.evidence or []
+                deterministic_scaffold = (
+                    f"{signal.agent_name}: {signal.message} | "
+                    f"actions={actions if actions else '{}'} | "
+                    f"evidence={'; '.join(str(item) for item in evidence[:3])}"
+                )
+                reasoning_addendum = (
+                    metadata.get("llm_reasoning_addendum")
+                    or metadata.get("llm_review_reasoning")
+                    or metadata.get("llm_review_message")
+                    or ""
+                )
                 rows.append(
                     {
                         "agent_name": signal.agent_name,
                         "decision_area": signal.decision_area,
+                        "deterministic_scaffold": deterministic_scaffold,
                         "deterministic_confidence": signal.confidence,
                         "llm_review_requested": bool(metadata.get("llm_review_requested")),
                         "llm_selection_reason": metadata.get("llm_selection_reason"),
                         "llm_used": bool(metadata.get("llm_used")),
                         "llm_model": metadata.get("llm_model"),
                         "llm_key": metadata.get("llm_key"),
+                        "llm_message": metadata.get("llm_review_message"),
+                        "llm_proposed_actions": metadata.get("llm_review_proposed_actions"),
                         "llm_error": metadata.get("llm_error"),
                         "decision_basis": metadata.get("decision_basis"),
-                        "reasoning_addendum": metadata.get("llm_reasoning_addendum"),
+                        "reasoning_addendum": reasoning_addendum,
                     }
                 )
         return rows

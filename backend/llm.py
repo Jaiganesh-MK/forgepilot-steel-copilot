@@ -940,13 +940,26 @@ class ReasoningSynthesizer:
 
     def _merge_agent_review(self, signal: AgentSignal, context: PlantContext, data: dict[str, Any], result: dict[str, str]) -> AgentSignal:
         original_metadata = dict(signal.metadata or {})
+        review_message = str(data.get("message") or "").strip()
+        review_reasoning = str(
+            data.get("reasoning_addendum")
+            or data.get("reasoning")
+            or data.get("rationale")
+            or data.get("explanation")
+            or ""
+        ).strip()
+        review_actions = data.get("proposed_actions") if isinstance(data.get("proposed_actions"), dict) else {}
         original_metadata.update(
             {
                 "llm_used": True,
                 "llm_model": result.get("model"),
                 "llm_key": result.get("key"),
                 "decision_basis": "deterministic_rules_plus_openrouter_specialist_review",
-                "llm_reasoning_addendum": str(data.get("reasoning_addendum") or "").strip(),
+                "llm_review_message": review_message,
+                "llm_review_confidence": data.get("confidence"),
+                "llm_review_severity": data.get("severity"),
+                "llm_review_proposed_actions": review_actions,
+                "llm_reasoning_addendum": review_reasoning,
             }
         )
 
@@ -961,8 +974,8 @@ class ReasoningSynthesizer:
         except Exception:
             confidence = signal.confidence
 
-        message = str(data.get("message") or signal.message).strip() or signal.message
-        addendum = str(data.get("reasoning_addendum") or "").strip()
+        message = review_message or signal.message
+        addendum = review_reasoning
         if addendum and addendum.lower() not in message.lower():
             message = f"{message} LLM review: {addendum}"
 
