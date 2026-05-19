@@ -144,7 +144,8 @@ class ReasoningSynthesizer:
                 response_schema=None,
                 total_timeout_seconds=config.OPENROUTER_TOTAL_TIMEOUT_SECONDS,
             )
-            return result["text"]
+            cleaned = self._sanitize_summary_text(result.get("text", ""), fallback)
+            return cleaned
         except requests.exceptions.Timeout:
             return fallback + "\n\nOpenRouter synthesis timed out; deterministic agent summary shown instead."
         except Exception as exc:
@@ -636,12 +637,87 @@ class ReasoningSynthesizer:
 
     @staticmethod
     def _build_summary_prompt(payload: dict[str, Any]) -> str:
+        state = payload.get("state", {})
+        recommendations = payload.get("recommendations", [])[:4]
+        signals = payload.get("signals", [])[:12]
+        llm_reviews = payload.get("llm_agent_reviews", [])
+        compact = {
+            "state": state,
+            "top_recommendations": [
+                {
+                    "agent_name": r.get("agent_name"),
+                    "decision_area": r.get("decision_area"),
+                    "action_summary": r.get("action_summary"),
+                    "confidence": r.get("confidence"),
+                    "risk_level": r.get("risk_level"),
+                    "reasoning": r.get("reasoning"),
+                    "approval_required": r.get("approval_required"),
+                }
+                for r in recommendations
+            ],
+            "agent_signals": [
+                {
+                    "agent_name": s.get("agent_name"),
+                    "decision_area": s.get("decision_area"),
+                    "severity": s.get("severity"),
+                    "confidence": s.get("confidence"),
+                    "message": s.get("message"),
+                    "proposed_actions": s.get("proposed_actions"),
+                    "llm_used": (s.get("metadata") or {}).get("llm_used"),
+                    "llm_model": (s.get("metadata") or {}).get("llm_model"),
+                }
+                for s in signals
+            ],
+            "llm_reviews": llm_reviews,
+        }
         return (
-            "Rewrite the deterministic/hybrid multi-agent blast furnace findings into a concise shift-console summary. "
-            "Return three short paragraphs with these labels: Current state, Recommended operator focus, "
-            "Safety and validation checks. Keep numeric values exactly as provided. Mention when specialist-agent LLM reviews were used.\n\n"
-            f"Payload JSON:\n{json.dumps(payload, default=str)[: config.OPENROUTER_PROMPT_CHAR_LIMIT]}"
+            "Create the operator-facing executive summary only. Do not repeat these instructions. "
+            "Do not say what you need to do. Do not include raw JSON. "
+            "Write exactly three concise paragraphs, each starting with one of these labels: "
+            "Current state:, Recommended operator focus:, Safety and validation checks:. "
+            "Use only the provided facts and keep numeric values exactly as provided. "
+            "Mention specialist-agent LLM review only if llm_used is true for at least one signal.\n\n"
+            f"FACTS_JSON:\n{json.dumps(compact, default=str, separators=(",", ":"))[: config.OPENROUTER_PROMPT_CHAR_LIMIT]}"
         )
+
+    @staticmethod
+    def _sanitize_summary_text(text: str, fallback: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return fallback + "\n\nOpenRouter returned an empty summary; deterministic agent summary shown instead."
+
+        # Remove common wrappers and accidental markdown fences.
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+            if cleaned.lower().startswith("text"):
+                cleaned = cleaned[4:].strip()
+
+        lower = cleaned.lower()
+        instruction_echo_markers = [
+            "we need to produce",
+            "we have dataset",
+            "must keep numeric",
+            "return three short paragraphs",
+            "facts_json",
+            "payload json",
+            "rewrite the deterministic",
+            "do not repeat these instructions",
+        ]
+        if any(marker in lower for marker in instruction_echo_markers):
+            return fallback + "\n\nOpenRouter summary echoed prompt instructions; deterministic agent summary shown instead."
+
+        # Keep only the three requested paragraphs if a model adds preamble.
+        start_markers = ["Current state:", "Current State:"]
+        starts = [cleaned.find(m) for m in start_markers if cleaned.find(m) >= 0]
+        if starts:
+            cleaned = cleaned[min(starts):].strip()
+
+        return cleaned[:2500]
 
     @staticmethod
     def _agent_system_prompt(signal: AgentSignal) -> str:

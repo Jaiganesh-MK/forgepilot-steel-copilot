@@ -860,8 +860,20 @@ def render_message_cards(messages: list[dict[str, Any]], limit: int = 12) -> Non
     if not messages:
         st.write("No inter-agent messages for the current timestamp.")
         return
+    priority = {
+        "specialist_review_response": 0,
+        "hybrid_specialist_output": 1,
+        "specialist_review_request": 2,
+        "specialist_review_fallback": 3,
+        "deterministic_specialist_output": 4,
+        "coordination_request": 5,
+    }
+    ordered_messages = sorted(
+        messages,
+        key=lambda m: (priority.get(str(m.get("message_type") or ""), 9), -float(m.get("confidence") or 0.0)),
+    )
     cards = ['<div class="bf-message-grid">']
-    for msg in messages[:limit]:
+    for msg in ordered_messages[:limit]:
         src = AGENT_SHORT_NAMES.get(str(msg.get("from_agent")), str(msg.get("from_agent") or "-"))
         tgt = AGENT_SHORT_NAMES.get(str(msg.get("to_agent")), str(msg.get("to_agent") or "-"))
         message_type = escape(str(msg.get("message_type") or "message"))

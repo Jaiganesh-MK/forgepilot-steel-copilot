@@ -303,26 +303,48 @@ class AgentCoordinator:
     def _build_messages(self, signals: list[AgentSignal]) -> list[AgentMessage]:
         messages: list[AgentMessage] = []
         active = [s for s in signals if s.proposed_actions or s.severity in {"medium", "high", "critical"}]
+
         for signal in active:
-            for dependency in signal.dependencies:
-                messages.append(AgentMessage(signal.agent_name, dependency, "coordination_request", f"{signal.decision_area}: {signal.message}", signal.confidence))
             metadata = signal.metadata or {}
-            if metadata.get("llm_used"):
+            action_summary = self._action_summary(signal.proposed_actions) if signal.proposed_actions else "No setpoint action proposed"
+
+            # Put LLM review messages before dependency messages so the dashboard cards show
+            # the actual hybrid specialist output instead of only the deterministic coordination scaffold.
+            if metadata.get("llm_review_requested"):
                 messages.append(
                     AgentMessage(
                         signal.agent_name,
                         "OpenRouterLLM",
                         "specialist_review_request",
-                        f"{signal.agent_name} sent evidence/actions to OpenRouter for domain review.",
+                        f"{signal.agent_name} submitted {signal.decision_area} evidence for LLM review. Selection reason: {metadata.get('llm_selection_reason', 'requested')}. Proposed action before review: {action_summary}.",
                         signal.confidence,
                     )
                 )
+
+            if metadata.get("llm_used"):
+                addendum = str(metadata.get("llm_reasoning_addendum") or "").strip()
+                response_parts = [
+                    f"Hybrid specialist review via {metadata.get('llm_model') or 'OpenRouter free model'}.",
+                    f"Reviewed output: {signal.message}",
+                    f"Current proposed action: {action_summary}.",
+                ]
+                if addendum and addendum.lower() not in signal.message.lower():
+                    response_parts.append(f"LLM rationale: {addendum}")
                 messages.append(
                     AgentMessage(
                         "OpenRouterLLM",
                         signal.agent_name,
                         "specialist_review_response",
-                        f"LLM specialist review returned via {metadata.get('llm_model')}; signal basis is hybrid.",
+                        " ".join(response_parts),
+                        signal.confidence,
+                    )
+                )
+                messages.append(
+                    AgentMessage(
+                        signal.agent_name,
+                        self.name,
+                        "hybrid_specialist_output",
+                        f"{signal.decision_area}: {signal.message} Proposed action: {action_summary}.",
                         signal.confidence,
                     )
                 )
@@ -332,10 +354,32 @@ class AgentCoordinator:
                         "OpenRouterLLM",
                         signal.agent_name,
                         "specialist_review_fallback",
-                        f"LLM review unavailable; {signal.agent_name} retained deterministic fallback.",
+                        f"LLM review unavailable for {signal.agent_name}; deterministic scaffold retained. Reason: {metadata.get('llm_error')}",
                         signal.confidence,
                     )
                 )
+            else:
+                messages.append(
+                    AgentMessage(
+                        signal.agent_name,
+                        self.name,
+                        "deterministic_specialist_output",
+                        f"{signal.decision_area}: {signal.message} Proposed action: {action_summary}.",
+                        signal.confidence,
+                    )
+                )
+
+            for dependency in signal.dependencies:
+                messages.append(
+                    AgentMessage(
+                        signal.agent_name,
+                        dependency,
+                        "coordination_request",
+                        f"{signal.decision_area}: {signal.message}",
+                        signal.confidence,
+                    )
+                )
+
         by_name = {s.agent_name: s for s in signals}
         thermal = by_name.get("ThermalStateAgent")
         perm = by_name.get("PermeabilityAgent")
