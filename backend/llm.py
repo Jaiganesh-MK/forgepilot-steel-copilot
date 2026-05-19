@@ -64,6 +64,12 @@ class ReasoningSynthesizer:
             "openrouter_preferred_min_throughput_p90": config.OPENROUTER_PREFERRED_MIN_THROUGHPUT_P90,
             "openrouter_require_parameters": config.OPENROUTER_REQUIRE_PARAMETERS,
             "openrouter_use_structured_outputs": config.OPENROUTER_USE_STRUCTURED_OUTPUTS,
+            "openrouter_agent_structured_outputs": config.OPENROUTER_AGENT_STRUCTURED_OUTPUTS,
+            "openrouter_agent_routing_mode": config.OPENROUTER_AGENT_ROUTING_MODE,
+            "openrouter_agent_thermal_models": config.OPENROUTER_AGENT_THERMAL_MODELS,
+            "openrouter_agent_flow_models": config.OPENROUTER_AGENT_FLOW_MODELS,
+            "openrouter_agent_fuel_models": config.OPENROUTER_AGENT_FUEL_MODELS,
+            "openrouter_agent_quality_models": config.OPENROUTER_AGENT_QUALITY_MODELS,
             "openrouter_use_response_healing": config.OPENROUTER_USE_RESPONSE_HEALING,
             "openrouter_cache_responses": config.OPENROUTER_CACHE_RESPONSES,
             "openrouter_free_models": self.models,
@@ -166,34 +172,107 @@ class ReasoningSynthesizer:
         context: PlantContext,
         timeout_seconds: float | None = None,
     ) -> list[AgentSignal]:
-        """Review several specialist signals in one OpenRouter request.
+        """Review specialist signals through OpenRouter.
 
-        This is the recommended free-model path because it consumes one request
-        per timestamp instead of one request per specialist agent.
+        Reliability strategy for free models:
+        - Default grouped mode sends 2-4 small domain batches instead of one large
+          strict-schema request or 10 parallel requests.
+        - Each group has a different free-model fallback chain, so thermal/flow/fuel/quality
+          reviews do not all depend on one free model.
+        - JSON is requested in the prompt and parsed/validated locally; strict schema
+          is optional because it can shrink the eligible free-model pool.
         """
         if not self.enabled or not signals:
             return signals
 
         max_batch = max(1, int(config.LLM_AGENT_BATCH_SIZE))
         signals = signals[:max_batch]
+
+        if config.OPENROUTER_AGENT_ROUTING_MODE == "grouped" and len(signals) > 1:
+            return self._review_agent_signal_groups(signals, context, timeout_seconds=timeout_seconds)
+
+        if config.OPENROUTER_AGENT_ROUTING_MODE == "single_agent" and len(signals) > 1:
+            reviewed: list[AgentSignal] = []
+            per_agent_budget = max(4.0, float(timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS) / max(len(signals), 1))
+            for signal in signals:
+                models = self._models_for_agent_group(self._agent_group_name(signal.agent_name))
+                reviewed.extend(
+                    self._review_agent_signals_batch_core(
+                        [signal],
+                        context,
+                        timeout_seconds=per_agent_budget,
+                        model_candidates=models,
+                        group_name=self._agent_group_name(signal.agent_name),
+                    )
+                )
+            return reviewed
+
+        return self._review_agent_signals_batch_core(
+            signals,
+            context,
+            timeout_seconds=timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
+            model_candidates=None,
+            group_name="single_batch",
+        )
+
+    def _review_agent_signal_groups(
+        self,
+        signals: list[AgentSignal],
+        context: PlantContext,
+        timeout_seconds: float | None = None,
+    ) -> list[AgentSignal]:
+        groups: dict[str, list[AgentSignal]] = {}
+        for signal in signals:
+            groups.setdefault(self._agent_group_name(signal.agent_name), []).append(signal)
+
+        total_budget = max(8.0, float(timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS))
+        # Keep a useful budget per group while allowing smaller groups to complete.
+        per_group_budget = max(8.0, min(config.OPENROUTER_TIMEOUT_SECONDS, total_budget / max(len(groups), 1) + 2.0))
+        reviewed_by_agent: dict[str, AgentSignal] = {}
+        for group_name, group_signals in groups.items():
+            models = self._models_for_agent_group(group_name)
+            reviewed = self._review_agent_signals_batch_core(
+                group_signals,
+                context,
+                timeout_seconds=per_group_budget,
+                model_candidates=models,
+                group_name=group_name,
+            )
+            for signal in reviewed:
+                reviewed_by_agent[signal.agent_name] = signal
+
+        return [reviewed_by_agent.get(signal.agent_name, signal) for signal in signals]
+
+    def _review_agent_signals_batch_core(
+        self,
+        signals: list[AgentSignal],
+        context: PlantContext,
+        timeout_seconds: float | None,
+        model_candidates: list[str] | None,
+        group_name: str,
+    ) -> list[AgentSignal]:
+        if not signals:
+            return []
         self.agent_review_stats["attempted"] = int(self.agent_review_stats.get("attempted", 0)) + len(signals)
 
         prompt = self._build_agent_batch_review_prompt(signals, context)
         system_prompt = (
-            "You are a panel of blast furnace specialist decision agents. "
-            "Review each deterministic specialist scaffold independently, then return one strict JSON object. "
-            "Do not invent measurements. Do not claim setpoints will be executed automatically. "
-            "Prefer stable, operator-approved advisory actions over productivity-optimized risk."
+            "You are a compact panel of blast furnace specialist decision agents. "
+            "Review each deterministic specialist scaffold independently. "
+            "Return valid JSON only, with top-level key agent_reviews. "
+            "No markdown, no prose outside JSON, no invented measurements, and no automatic setpoint execution claims."
         )
+        response_schema = self._batch_agent_response_schema() if config.OPENROUTER_AGENT_STRUCTURED_OUTPUTS else None
         try:
             result = self._invoke_openrouter(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                purpose="agent_batch_review:" + ",".join(signal.agent_name for signal in signals),
+                purpose=f"agent_group_review:{group_name}:" + ",".join(signal.agent_name for signal in signals),
                 max_tokens=config.OPENROUTER_AGENT_BATCH_MAX_TOKENS,
                 temperature=config.OPENROUTER_AGENT_TEMPERATURE,
-                response_schema=self._batch_agent_response_schema(),
+                response_schema=response_schema,
                 total_timeout_seconds=timeout_seconds or config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
+                model_candidates_override=model_candidates,
             )
             data = self._parse_json_response(result["text"])
             reviews = data.get("agent_reviews", []) if isinstance(data, dict) else []
@@ -215,13 +294,38 @@ class ReasoningSynthesizer:
                 refined.append(refined_signal)
             return refined
         except Exception as exc:
-            self.last_error = f"batch_review: {exc}"
+            self.last_error = f"{group_name}_batch_review: {exc}"
             refined = []
             for signal in signals:
                 self.agent_review_stats["failed"] = int(self.agent_review_stats.get("failed", 0)) + 1
                 self._record_agent_review(signal.agent_name, False, None, str(exc))
                 refined.append(self._mark_signal_llm_fallback(signal, str(exc)))
             return refined
+
+    @staticmethod
+    def _agent_group_name(agent_name: str) -> str:
+        name = str(agent_name).lower()
+        if any(token in name for token in ["thermal", "blasttemperature", "oxygen"]):
+            return "thermal"
+        if any(token in name for token in ["permeability", "wind", "toppressure", "burden"]):
+            return "flow"
+        if any(token in name for token in ["pci", "coke", "fuel"]):
+            return "fuel"
+        if any(token in name for token in ["quality", "tapping"]):
+            return "quality"
+        return "default"
+
+    @staticmethod
+    def _models_for_agent_group(group_name: str) -> list[str]:
+        if group_name == "thermal":
+            return config.OPENROUTER_AGENT_THERMAL_MODELS
+        if group_name == "flow":
+            return config.OPENROUTER_AGENT_FLOW_MODELS
+        if group_name == "fuel":
+            return config.OPENROUTER_AGENT_FUEL_MODELS
+        if group_name == "quality":
+            return config.OPENROUTER_AGENT_QUALITY_MODELS
+        return config.OPENROUTER_AGENT_DEFAULT_MODELS
 
     def _invoke_openrouter(
         self,
@@ -232,11 +336,12 @@ class ReasoningSynthesizer:
         temperature: float,
         response_schema: dict[str, Any] | None = None,
         total_timeout_seconds: float | None = None,
+        model_candidates_override: list[str] | None = None,
     ) -> dict[str, str]:
         if not self.enabled:
             raise RuntimeError("OpenRouter is not enabled or no valid API key is configured.")
 
-        model_candidates = self._model_candidates()
+        model_candidates = self._sanitize_model_candidates(model_candidates_override) if model_candidates_override else self._model_candidates()
         cache_key = self._cache_key(
             purpose,
             system_prompt,
@@ -300,6 +405,20 @@ class ReasoningSynthesizer:
         if last_exc:
             raise last_exc
         raise RuntimeError("OpenRouter call failed without a specific error.")
+
+    @staticmethod
+    def _sanitize_model_candidates(models: list[str] | None) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for model in models or []:
+            model = str(model).strip()
+            lowered = model.lower()
+            if not model or not (lowered.endswith(":free") or lowered == "openrouter/free"):
+                continue
+            if lowered not in seen:
+                seen.add(lowered)
+                deduped.append(model)
+        return deduped or config.OPENROUTER_AGENT_DEFAULT_MODELS
 
     def _model_candidates(self) -> list[str]:
         models = self._model_order()
@@ -487,7 +606,8 @@ class ReasoningSynthesizer:
         prompt = self._agent_prompt_payload(signals, context)
         prompt["task"] = (
             "Review every specialist agent signal in deterministic_scaffolds. "
-            "Return exactly one agent_reviews entry per input agent_name."
+            "Return exactly one agent_reviews entry per input agent_name. "
+            "The output must be valid compact JSON only: {\"agent_reviews\":[{\"agent_name\":...,\"severity\":\"low|medium|high|critical\",\"confidence\":0.0-1.0,\"message\":...,\"proposed_actions\":{},\"reasoning_addendum\":...,\"evidence_additions\":[],\"prerequisites\":[],\"risk_tags\":[]}]}"
         )
         # Batch prompts need room for all agents but should stay compact for free models.
         limit = max(config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT, min(14000, config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT * 2))

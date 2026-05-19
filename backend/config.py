@@ -128,6 +128,40 @@ OPENROUTER_REQUIRE_PARAMETERS = _as_bool(os.getenv("OPENROUTER_REQUIRE_PARAMETER
 OPENROUTER_USE_STRUCTURED_OUTPUTS = _as_bool(os.getenv("OPENROUTER_USE_STRUCTURED_OUTPUTS", "true"), True)
 OPENROUTER_USE_RESPONSE_HEALING = _as_bool(os.getenv("OPENROUTER_USE_RESPONSE_HEALING", "true"), True)
 
+# Free-model reliability mode for specialist-agent reviews. Strict JSON-schema
+# routing can reduce the eligible free-model pool; for deployed demos, prompt-only
+# JSON is often more reliable while still being parsed and validated locally.
+OPENROUTER_AGENT_STRUCTURED_OUTPUTS = _as_bool(os.getenv("OPENROUTER_AGENT_STRUCTURED_OUTPUTS", "false"), False)
+OPENROUTER_AGENT_ROUTING_MODE = os.getenv("OPENROUTER_AGENT_ROUTING_MODE", "grouped").strip().lower()
+if OPENROUTER_AGENT_ROUTING_MODE not in {"single_batch", "grouped", "single_agent"}:
+    OPENROUTER_AGENT_ROUTING_MODE = "grouped"
+
+def _free_model_list(value: str | None, default: list[str]) -> list[str]:
+    parsed = _parse_list(value) if value else default.copy()
+    cleaned = [model for model in parsed if _is_free_model(model)]
+    return cleaned or default.copy()
+
+OPENROUTER_AGENT_THERMAL_MODELS = _free_model_list(
+    os.getenv("OPENROUTER_AGENT_THERMAL_MODELS"),
+    ["google/gemma-3-27b-it:free", "openai/gpt-oss-120b:free", "openrouter/free"],
+)
+OPENROUTER_AGENT_FLOW_MODELS = _free_model_list(
+    os.getenv("OPENROUTER_AGENT_FLOW_MODELS"),
+    ["google/gemma-3-27b-it:free", "minimax/minimax-m2.5:free", "openrouter/free"],
+)
+OPENROUTER_AGENT_FUEL_MODELS = _free_model_list(
+    os.getenv("OPENROUTER_AGENT_FUEL_MODELS"),
+    ["openai/gpt-oss-120b:free", "nvidia/nemotron-3-super-120b-a12b:free", "openrouter/free"],
+)
+OPENROUTER_AGENT_QUALITY_MODELS = _free_model_list(
+    os.getenv("OPENROUTER_AGENT_QUALITY_MODELS"),
+    ["minimax/minimax-m2.5:free", "google/gemma-3-27b-it:free", "openrouter/free"],
+)
+OPENROUTER_AGENT_DEFAULT_MODELS = _free_model_list(
+    os.getenv("OPENROUTER_AGENT_DEFAULT_MODELS"),
+    ["openrouter/free", "openai/gpt-oss-120b:free", "google/gemma-3-27b-it:free"],
+)
+
 OPENROUTER_MODEL_SELECTION = os.getenv("OPENROUTER_MODEL_SELECTION", os.getenv("OPENROUTER_MODEL_STRATEGY", "round_robin")).strip().lower()
 if OPENROUTER_MODEL_SELECTION not in {"round_robin", "fallback", "random"}:
     OPENROUTER_MODEL_SELECTION = "round_robin"
