@@ -107,6 +107,15 @@ class ReasoningSynthesizer:
             "agent_review_stats": self.agent_review_stats,
         }
 
+    @staticmethod
+    def _metadata_is_llm_first_mode(metadata: dict[str, Any] | None) -> bool:
+        mode = str((metadata or {}).get("llm_reasoning_mode") or "").strip().lower()
+        return mode in {"llm_first", "langgraph_llm_first"}
+
+    @staticmethod
+    def _is_llm_first_mode(signal: AgentSignal) -> bool:
+        return ReasoningSynthesizer._metadata_is_llm_first_mode(signal.metadata or {})
+
     def key_health(self) -> dict[str, Any]:
         if not self.api_keys:
             return {"ok": False, "error": "No OpenRouter API key configured"}
@@ -283,7 +292,7 @@ class ReasoningSynthesizer:
         self.agent_review_stats["attempted"] = int(self.agent_review_stats.get("attempted", 0)) + len(signals)
 
         prompt = self._build_agent_batch_review_prompt(signals, context)
-        if any((signal.metadata or {}).get("llm_reasoning_mode") == "llm_first" for signal in signals):
+        if any(self._is_llm_first_mode(signal) for signal in signals):
             system_prompt = (
                 "You are a team of specialist blast furnace AI decision agents. "
                 "Reason from the supplied plant state, trends, allowed action bounds, and each agent's responsibility. "
@@ -755,7 +764,7 @@ class ReasoningSynthesizer:
         return json.dumps(prompt, default=str)[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _build_agent_batch_review_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
-        if any((signal.metadata or {}).get("llm_reasoning_mode") == "llm_first" for signal in signals):
+        if any(self._is_llm_first_mode(signal) for signal in signals):
             return self._build_agent_llm_first_prompt(signals, context)
 
         row = self._compact_state(context)
@@ -1121,18 +1130,32 @@ class ReasoningSynthesizer:
     @staticmethod
     def _text_fallback_reviews(signals: list[AgentSignal], text: str) -> list[dict[str, Any]]:
         # Free models sometimes return commentary or malformed JSON. Do not surface
-        # raw model output in operator cards. Treat this as an LLM contact, but keep
-        # the deterministic scaffold clean and unchanged.
+        # raw model output in operator cards. In LLM-first mode, avoid repeating the
+        # neutral seed text such as "No setpoint action proposed"; show a concise
+        # review-status message instead.
+        clean_text = ReasoningSynthesizer._strip_markdown_code_fences(str(text or "")).strip()
+        clean_text = " ".join(clean_text.split())[:280]
         reviews: list[dict[str, Any]] = []
         for signal in signals:
+            is_llm_first = ReasoningSynthesizer._is_llm_first_mode(signal)
+            if is_llm_first:
+                message = f"{signal.decision_area}: OpenRouter returned an unstructured LLM-first review; no validated setpoint change was accepted."
+                actions = {"monitoring_action": "Review OpenRouter diagnostics and continue operator-supervised monitoring; no LLM setpoint action accepted."}
+                reasoning = clean_text if clean_text and not clean_text.startswith("{") else "The model response was not valid specialist JSON, so the safety validator blocked action adoption."
+                confidence = 0.25
+            else:
+                message = signal.message
+                actions = signal.proposed_actions
+                reasoning = ""
+                confidence = max(0.0, min(1.0, float(signal.confidence)))
             reviews.append({
                 "agent_name": signal.agent_name,
                 "severity": signal.severity,
-                "confidence": max(0.0, min(1.0, float(signal.confidence))),
-                "message": signal.message,
-                "proposed_actions": signal.proposed_actions,
-                "reasoning_addendum": "",
-                "evidence_additions": ["OpenRouter returned an unstructured review; deterministic recommendation retained."],
+                "confidence": confidence,
+                "message": message,
+                "proposed_actions": actions,
+                "reasoning_addendum": reasoning,
+                "evidence_additions": ["OpenRouter returned an unstructured review; deterministic safety validation retained."],
                 "prerequisites": signal.prerequisites or ["Operator approval required for setpoint changes"],
                 "risk_tags": signal.risk_tags,
                 "raw_model_output_redacted": True,
@@ -1239,7 +1262,7 @@ class ReasoningSynthesizer:
                 "llm_used": True,
                 "llm_model": result.get("model"),
                 "llm_key": result.get("key"),
-                "decision_basis": "llm_first_specialist_reasoning_plus_deterministic_safety_validation" if original_metadata.get("llm_reasoning_mode") == "llm_first" else "deterministic_rules_plus_openrouter_specialist_review",
+                "decision_basis": "llm_first_specialist_reasoning_plus_deterministic_safety_validation" if self._metadata_is_llm_first_mode(original_metadata) else "deterministic_rules_plus_openrouter_specialist_review",
                 "llm_review_message": review_message,
                 "llm_review_confidence": data.get("confidence"),
                 "llm_review_severity": data.get("severity"),
@@ -1247,8 +1270,8 @@ class ReasoningSynthesizer:
                 "llm_reasoning_addendum": review_reasoning,
             }
         )
-        if original_metadata.get("llm_reasoning_mode") == "llm_first":
-            original_metadata["deterministic_scaffold_text"] = "Not used in LLM-first mode. The LLM specialist reasoned from plant state and allowed action bounds; deterministic logic only validates/falls back."
+        if self._metadata_is_llm_first_mode(original_metadata):
+            original_metadata["deterministic_scaffold_text"] = "Not used in LLM-first mode. The LLM specialist reasoned from plant state, shared operating memory, agent playbook, trends, similar cases, and allowed action bounds; deterministic logic only validates/falls back."
 
         original_severity = str(signal.severity or "low").lower()
         requested_severity = str(data.get("severity") or original_severity).lower()
