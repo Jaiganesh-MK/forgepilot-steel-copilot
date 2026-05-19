@@ -90,6 +90,7 @@ class ReasoningSynthesizer:
             "openrouter_agent_temperature": config.OPENROUTER_AGENT_TEMPERATURE,
             "llm_specialist_agents_config_enabled": config.USE_LLM_AGENTS,
             "llm_agent_mode": config.LLM_AGENT_MODE,
+            "llm_agent_reasoning_mode": config.LLM_AGENT_REASONING_MODE,
             "llm_agent_max_agents": config.LLM_AGENT_MAX_AGENTS,
             "llm_agent_max_workers": config.LLM_AGENT_MAX_WORKERS,
             "llm_agent_total_timeout_seconds": config.LLM_AGENT_TOTAL_TIMEOUT_SECONDS,
@@ -282,11 +283,19 @@ class ReasoningSynthesizer:
         self.agent_review_stats["attempted"] = int(self.agent_review_stats.get("attempted", 0)) + len(signals)
 
         prompt = self._build_agent_batch_review_prompt(signals, context)
-        system_prompt = (
-            "You are a blast furnace operations review copilot. "
-            "Check deterministic specialist agent recommendations for consistency and safety. "
-            "Prefer concise JSON. Do not invent measurements or claim automatic execution."
-        )
+        if any((signal.metadata or {}).get("llm_reasoning_mode") == "llm_first" for signal in signals):
+            system_prompt = (
+                "You are a team of specialist blast furnace AI decision agents. "
+                "Reason from the supplied plant state, trends, allowed action bounds, and each agent's responsibility. "
+                "Do not rely on deterministic recommendations. Return concise JSON only. "
+                "Never invent measurements or claim automatic execution."
+            )
+        else:
+            system_prompt = (
+                "You are a blast furnace operations review copilot. "
+                "Check deterministic specialist agent recommendations for consistency and safety. "
+                "Prefer concise JSON. Do not invent measurements or claim automatic execution."
+            )
         response_schema = self._batch_agent_response_schema() if config.OPENROUTER_AGENT_STRUCTURED_OUTPUTS else None
         try:
             result = self._invoke_openrouter(
@@ -746,6 +755,9 @@ class ReasoningSynthesizer:
         return json.dumps(prompt, default=str)[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _build_agent_batch_review_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
+        if any((signal.metadata or {}).get("llm_reasoning_mode") == "llm_first" for signal in signals):
+            return self._build_agent_llm_first_prompt(signals, context)
+
         row = self._compact_state(context)
         compact_state_keys = [
             "timestamp", "event_label", "operating_mode", "plant_risk_level", "plant_risk_score",
@@ -799,6 +811,76 @@ class ReasoningSynthesizer:
         }
         return json.dumps(prompt, default=str, separators=(",", ":"))[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
+    def _build_agent_llm_first_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
+        responsibilities = {
+            "ThermalStateAgent": "assess furnace thermal stability and hot/cold drift",
+            "PermeabilityAgent": "assess gas-flow restriction, burden permeability, slip/hang risk",
+            "WindVolumeAgent": "recommend whether wind volume should increase, decrease, or hold",
+            "PCIAgent": "recommend PCI injection adjustments while protecting permeability and thermal reserve",
+            "CokeRateAgent": "recommend coke-rate support for thermal and structural stability",
+            "FuelRateAgent": "assess total fuel balance and efficiency without destabilizing operation",
+            "OxygenEnrichmentAgent": "recommend oxygen enrichment adjustments within safe raceway/thermal limits",
+            "BlastTemperatureAgent": "recommend hot blast temperature adjustment for thermal stabilization",
+            "TopPressureAgent": "recommend top-pressure adjustment while protecting gas-flow stability",
+            "BurdenDistributionAgent": "recommend burden/charging distribution changes for gas-flow and permeability",
+            "TappingAgent": "assess tapping urgency and hearth-management priority",
+            "QualityAgent": "assess hot-metal quality stability, especially silicon/sulfur drift",
+        }
+        agent_requests = []
+        for signal in signals:
+            agent_requests.append({
+                "agent_name": signal.agent_name,
+                "decision_area": signal.decision_area,
+                "responsibility": responsibilities.get(signal.agent_name, f"reason over {signal.decision_area}"),
+                "must_return": [
+                    "diagnosis",
+                    "operator-facing recommendation",
+                    "small bounded proposed_actions only if justified",
+                    "confidence from 0.05 to 0.98",
+                    "evidence using provided plant numbers",
+                    "operator approval prerequisites",
+                ],
+            })
+        allowed_actions = {
+            **{key: {"min": lo, "max": hi} for key, (lo, hi) in config.ACTION_LIMITS.items()},
+            "burden_distribution_change": "short charging-pattern advisory, or omit",
+            "tapping_priority": "Normal / Expedite / Delay, or omit",
+            "monitoring_action": "non-control workflow instruction, or omit",
+        }
+        prompt = {
+            "task": "Run LLM-first specialist-agent reasoning for the selected blast-furnace state and return valid JSON only.",
+            "critical_rules": [
+                "Return JSON only. Do not use markdown fences.",
+                "The response must be a JSON object with key agent_reviews.",
+                "Return exactly one review per expected_agent_names entry.",
+                "Each review.agent_name must exactly match one expected_agent_names value.",
+                "Do not use or reference a deterministic scaffold; none is provided in this mode.",
+                "Use only the provided plant_state, recent_trends, similar_cases, agent_responsibilities, and allowed_actions.",
+                "Do not invent measurements, targets, or plant events.",
+                "If evidence is weak or plant risk is low, prefer monitoring_action or proposed_actions={}.",
+                "All setpoint changes are recommendations requiring operator approval; never claim automatic execution.",
+                "Keep numeric changes small and inside allowed_actions.",
+            ],
+            "review_item_shape": {
+                "agent_name": "exact name from expected_agent_names",
+                "severity": "low|medium|high|critical",
+                "confidence": "0.05 to 0.98",
+                "message": "one short operator-facing recommendation",
+                "proposed_actions": "object with allowed action keys only, or empty object",
+                "reasoning_addendum": "one short reason using plant numbers",
+                "evidence_additions": "array of short strings using provided plant numbers",
+                "prerequisites": "array of checks/approvals",
+                "risk_tags": "array of short tags",
+            },
+            "expected_agent_names": [s.agent_name for s in signals],
+            "agent_responsibilities": agent_requests,
+            "allowed_actions": allowed_actions,
+            "plant_state": self._compact_state(context),
+            "recent_trends": self._compact_trends(context),
+            "similar_cases": context.similar_cases[:2],
+        }
+        return json.dumps(prompt, default=str, separators=(",", ":"))[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
+
     def _agent_prompt_payload(self, signals: list[AgentSignal], context: PlantContext) -> dict[str, Any]:
         allowed_actions = {
             **{key: {"min": lo, "max": hi} for key, (lo, hi) in config.ACTION_LIMITS.items()},
@@ -809,7 +891,7 @@ class ReasoningSynthesizer:
         return {
             "hard_constraints": [
                 "Return valid JSON only. No markdown.",
-                "Do not invent measurements. Use only plant_state, recent_trends, similar_cases, and scaffold evidence.",
+                "Do not invent measurements. Use only plant_state, recent_trends, similar_cases, and supplied evidence.",
                 "If plant risk is low and evidence is weak or conflicting, prefer proposed_actions={} and monitoring.",
                 "If restriction, thermal, quality, or hearth risk is credible, keep changes small and inside allowed_actions.",
                 "Never state that an action is executed automatically. All setpoint changes are recommendations for operator approval.",
@@ -954,7 +1036,7 @@ class ReasoningSynthesizer:
                 "llm_used": True,
                 "llm_model": result.get("model"),
                 "llm_key": result.get("key"),
-                "decision_basis": "deterministic_rules_plus_openrouter_specialist_review",
+                "decision_basis": "llm_first_specialist_reasoning_plus_deterministic_safety_validation" if original_metadata.get("llm_reasoning_mode") == "llm_first" else "deterministic_rules_plus_openrouter_specialist_review",
                 "llm_review_message": review_message,
                 "llm_review_confidence": data.get("confidence"),
                 "llm_review_severity": data.get("severity"),
@@ -962,6 +1044,8 @@ class ReasoningSynthesizer:
                 "llm_reasoning_addendum": review_reasoning,
             }
         )
+        if original_metadata.get("llm_reasoning_mode") == "llm_first":
+            original_metadata["deterministic_scaffold_text"] = "Not used in LLM-first mode. The LLM specialist reasoned from plant state and allowed action bounds; deterministic logic only validates/falls back."
 
         original_severity = str(signal.severity or "low").lower()
         requested_severity = str(data.get("severity") or original_severity).lower()

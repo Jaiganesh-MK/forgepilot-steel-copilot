@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any
@@ -55,20 +56,34 @@ class AgentCoordinator:
         llm_agent_max_agents: int | None = None,
         llm_agent_timeout_seconds: float | None = None,
         llm_agent_max_workers: int | None = None,
+        llm_agent_reasoning_mode: str | None = None,
     ) -> dict[str, Any]:
         deterministic_signals = [agent.evaluate(context) for agent in self.agents]
-        llm_agent_requested = bool(include_llm_agents or config.USE_LLM_AGENTS)
-        signals = (
-            self._review_signals_with_llm(
+        requested_mode = (llm_agent_reasoning_mode or config.LLM_AGENT_REASONING_MODE or "hybrid_scaffold").strip().lower()
+        if requested_mode not in {"hybrid_scaffold", "llm_first", "deterministic_only"}:
+            requested_mode = "hybrid_scaffold"
+        llm_agent_requested = bool(include_llm_agents or config.USE_LLM_AGENTS) and requested_mode != "deterministic_only"
+
+        if llm_agent_requested and requested_mode == "llm_first":
+            seed_signals = self._make_llm_first_seed_signals(context, deterministic_signals)
+            reviewed_seed_signals = self._review_signals_with_llm(
+                seed_signals,
+                context,
+                max_agents=llm_agent_max_agents,
+                timeout_seconds=llm_agent_timeout_seconds,
+                max_workers=llm_agent_max_workers,
+            )
+            signals = self._replace_failed_llm_first_with_deterministic(reviewed_seed_signals, deterministic_signals)
+        elif llm_agent_requested:
+            signals = self._review_signals_with_llm(
                 deterministic_signals,
                 context,
                 max_agents=llm_agent_max_agents,
                 timeout_seconds=llm_agent_timeout_seconds,
                 max_workers=llm_agent_max_workers,
             )
-            if llm_agent_requested
-            else deterministic_signals
-        )
+        else:
+            signals = deterministic_signals
         self._last_llm_agent_requested = [s.agent_name for s in signals if (s.metadata or {}).get("llm_review_requested")]
         self._last_llm_agent_reviewed = [s.agent_name for s in signals if (s.metadata or {}).get("llm_used")]
 
@@ -93,12 +108,77 @@ class AgentCoordinator:
             "similar_cases": context.similar_cases,
             "playbook_matches": self._playbook_matches(context, signals),
             "llm_agent_reviews": self._llm_agent_reviews(signals),
-            "architecture_status": self._architecture_status(llm_agent_requested=llm_agent_requested),
+            "architecture_status": self._architecture_status(llm_agent_requested=llm_agent_requested, reasoning_mode=requested_mode),
         }
         payload["executive_summary"] = self.synthesizer.synthesize(payload) if include_llm_summary else self.synthesizer.deterministic_summary(payload)
         payload["summary_source"] = "openrouter_or_fallback" if include_llm_summary else "deterministic"
-        payload["architecture_status"] = self._architecture_status(llm_agent_requested=llm_agent_requested)
+        payload["architecture_status"] = self._architecture_status(llm_agent_requested=llm_agent_requested, reasoning_mode=requested_mode)
         return payload
+
+    def _make_llm_first_seed_signals(self, context: PlantContext, deterministic_signals: list[AgentSignal]) -> list[AgentSignal]:
+        """Create neutral specialist-agent requests for LLM-first reasoning.
+
+        In this mode the LLM is not shown the deterministic scaffold as the
+        reasoning source. The deterministic signal is kept only as a private
+        fallback if the LLM call fails or returns unusable content.
+        """
+        fallback_by_agent = {signal.agent_name: signal for signal in deterministic_signals}
+        seeds: list[AgentSignal] = []
+        plant_score = safe_float(context.current.get("plant_risk_score"))
+        event_label = str(context.current.get("event_label", "normal"))
+        for agent in self.agents:
+            fallback = fallback_by_agent.get(agent.name)
+            metadata = {
+                "decision_basis": "llm_first_pending_safety_validation",
+                "llm_reasoning_mode": "llm_first",
+                "deterministic_fallback_available": bool(fallback),
+                "deterministic_fallback_confidence": fallback.confidence if fallback else None,
+                "deterministic_fallback_message": fallback.message if fallback else None,
+                "deterministic_scaffold_text": "Not used in LLM-first mode. Deterministic logic is retained only as fallback and safety validation.",
+            }
+            seeds.append(
+                AgentSignal(
+                    agent.name,
+                    agent.decision_area,
+                    "medium" if plant_score >= 50 or event_label.lower() != "normal" else "low",
+                    0.0,
+                    f"LLM-first review requested for {agent.decision_area}. No deterministic scaffold supplied to the model.",
+                    [
+                        f"Plant risk score: {plant_score:.1f}",
+                        f"Detected scenario: {event_label}",
+                        "Specialist must reason from current plant state and allowed action bounds.",
+                    ],
+                    {},
+                    [],
+                    ["Operator approval required for setpoint changes"],
+                    ["llm_first"],
+                    metadata,
+                )
+            )
+        return seeds
+
+    @staticmethod
+    def _replace_failed_llm_first_with_deterministic(reviewed_signals: list[AgentSignal], deterministic_signals: list[AgentSignal]) -> list[AgentSignal]:
+        fallback_by_agent = {signal.agent_name: signal for signal in deterministic_signals}
+        final: list[AgentSignal] = []
+        for signal in reviewed_signals:
+            metadata = dict(signal.metadata or {})
+            if metadata.get("llm_reasoning_mode") == "llm_first" and not metadata.get("llm_used"):
+                fallback = fallback_by_agent.get(signal.agent_name)
+                if fallback is not None:
+                    fallback_metadata = dict(fallback.metadata or {})
+                    fallback_metadata.update({
+                        "llm_review_requested": metadata.get("llm_review_requested"),
+                        "llm_used": False,
+                        "llm_error": metadata.get("llm_error") or "LLM-first review did not complete; deterministic fallback shown.",
+                        "llm_reasoning_mode": "llm_first",
+                        "decision_basis": "deterministic_rules_fallback_after_llm_first_failure",
+                        "deterministic_scaffold_text": "Fallback deterministic signal shown because LLM-first review did not produce a usable specialist output.",
+                    })
+                    final.append(replace(fallback, metadata=fallback_metadata))
+                    continue
+            final.append(signal)
+        return final
 
     def llm_status(self) -> dict[str, Any]:
         return self.synthesizer.status()
@@ -159,7 +239,9 @@ class AgentCoordinator:
     def _mark_llm_agent_selected(signal: AgentSignal) -> AgentSignal:
         metadata = dict(signal.metadata or {})
         threshold = float(config.LLM_AGENT_CONFIDENCE_THRESHOLD)
-        if signal.confidence < threshold:
+        if (signal.metadata or {}).get("llm_reasoning_mode") == "llm_first":
+            selection_reason = "llm_first_specialist_reasoning_requested"
+        elif signal.confidence < threshold:
             selection_reason = f"deterministic_confidence_{signal.confidence:.2f}_below_{threshold:.2f}"
         elif signal.proposed_actions:
             selection_reason = "active_recommendation"
@@ -255,7 +337,7 @@ class AgentCoordinator:
         selected = low_confidence_selected + regular_selected
         return selected[:review_limit]
 
-    def _architecture_status(self, llm_agent_requested: bool = False) -> dict[str, Any]:
+    def _architecture_status(self, llm_agent_requested: bool = False, reasoning_mode: str | None = None) -> dict[str, Any]:
         status = self.synthesizer.status()
         if config.OPENROUTER_INCLUDE_KEY_HEALTH_CHECK:
             try:
@@ -268,6 +350,7 @@ class AgentCoordinator:
                 "direct_action_confidence_threshold": config.DIRECT_ACTION_CONFIDENCE_THRESHOLD,
                 "default_safety_posture": "Setpoint changes require operator approval unless ALLOW_DIRECT_SETPOINT_ACTIONS=true.",
                 "llm_specialist_agents_requested": llm_agent_requested,
+                "llm_agent_reasoning_mode": reasoning_mode or config.LLM_AGENT_REASONING_MODE,
                 "llm_specialist_agents_active": bool(llm_agent_requested and self.synthesizer.enabled),
                 "llm_specialist_agents_requested_list": self._last_llm_agent_requested,
                 "llm_specialist_agents_reviewed": self._last_llm_agent_reviewed,
@@ -277,7 +360,7 @@ class AgentCoordinator:
                 "llm_agent_confidence_threshold": config.LLM_AGENT_CONFIDENCE_THRESHOLD,
                 "llm_agent_review_low_confidence": config.LLM_AGENT_REVIEW_LOW_CONFIDENCE,
                 "llm_agent_low_confidence_overrides_limit": config.LLM_AGENT_LOW_CONFIDENCE_OVERRIDES_LIMIT,
-                "llm_agent_note": "Specialist agents run deterministic evidence first. When specialist LLM review is requested, selected sub-threshold agents are reviewed through a batched OpenRouter JSON request before coordination.",
+                "llm_agent_note": "Reasoning mode controls specialist behavior: hybrid_scaffold sends deterministic signals for LLM review; llm_first asks LLM specialists to reason from plant state directly and uses deterministic logic only as fallback/safety validation.",
             }
         )
         return status
@@ -642,7 +725,7 @@ class AgentCoordinator:
             if metadata.get("llm_review_requested") or metadata.get("llm_used") or metadata.get("llm_error"):
                 actions = signal.proposed_actions or {}
                 evidence = signal.evidence or []
-                deterministic_scaffold = (
+                deterministic_scaffold = metadata.get("deterministic_scaffold_text") or (
                     f"{signal.agent_name}: {signal.message} | "
                     f"actions={actions if actions else '{}'} | "
                     f"evidence={'; '.join(str(item) for item in evidence[:3])}"

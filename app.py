@@ -307,6 +307,7 @@ def _run_llm_review_job(
     llm_agent_max_agents: int | None,
     llm_agent_timeout_seconds: float | None,
     llm_agent_max_workers: int | None,
+    llm_agent_reasoning_mode: str | None,
 ) -> None:
     runtime = get_runtime()
     with runtime.lock:
@@ -320,6 +321,7 @@ def _run_llm_review_job(
             llm_agent_max_agents=llm_agent_max_agents,
             llm_agent_timeout_seconds=llm_agent_timeout_seconds,
             llm_agent_max_workers=llm_agent_max_workers,
+            llm_agent_reasoning_mode=llm_agent_reasoning_mode,
         )
         with runtime.lock:
             if job_id in runtime.jobs:
@@ -405,6 +407,7 @@ def api_get(base_url: str, path: str, params: dict[str, Any] | None = None) -> d
             llm_agent_max_agents=as_int("llm_agent_max_agents"),
             llm_agent_timeout_seconds=as_float("llm_agent_timeout_seconds"),
             llm_agent_max_workers=as_int("llm_agent_max_workers"),
+            llm_agent_reasoning_mode=str(params.get("llm_agent_reasoning_mode", "hybrid_scaffold")),
         )
     if path.startswith("/api/llm-review/"):
         job_id = path.rsplit("/", 1)[-1]
@@ -456,6 +459,7 @@ def api_post(base_url: str, path: str, params: dict[str, Any] | None = None, jso
         llm_agent_max_agents = int(params.get("llm_agent_max_agents", 1))
         llm_agent_timeout_seconds = float(params.get("llm_agent_timeout_seconds", 12.0))
         llm_agent_max_workers = int(params.get("llm_agent_max_workers", 1))
+        llm_agent_reasoning_mode = str(params.get("llm_agent_reasoning_mode", "hybrid_scaffold"))
         job = {
             "job_id": job_id,
             "status": "queued",
@@ -465,6 +469,7 @@ def api_post(base_url: str, path: str, params: dict[str, Any] | None = None, jso
             "llm_agent_max_agents": llm_agent_max_agents,
             "llm_agent_timeout_seconds": llm_agent_timeout_seconds,
             "llm_agent_max_workers": llm_agent_max_workers,
+            "llm_agent_reasoning_mode": llm_agent_reasoning_mode,
             "created_at_epoch": now,
             "started_at_epoch": None,
             "completed_at_epoch": None,
@@ -486,6 +491,7 @@ def api_post(base_url: str, path: str, params: dict[str, Any] | None = None, jso
             llm_agent_max_agents,
             llm_agent_timeout_seconds,
             llm_agent_max_workers,
+            llm_agent_reasoning_mode,
         )
         api_get.clear()
         return {"job_id": job_id, "status": "queued", "dataset_index": idx, "message": "OpenRouter LLM review job started."}
@@ -907,6 +913,18 @@ with st.sidebar:
     st.header("OpenRouter LLM review")
     include_llm_agents = st.toggle("Review specialist agents with OpenRouter", value=False)
     include_llm = st.toggle("Generate final OpenRouter reasoning summary", value=False)
+    llm_reasoning_labels = {
+        "LLM-first agents + deterministic safety validation": "llm_first",
+        "Deterministic scaffold + LLM review": "hybrid_scaffold",
+        "Deterministic only": "deterministic_only",
+    }
+    llm_reasoning_label = st.selectbox(
+        "Specialist reasoning mode",
+        list(llm_reasoning_labels.keys()),
+        index=0,
+        disabled=not include_llm_agents,
+    )
+    llm_agent_reasoning_mode = llm_reasoning_labels[llm_reasoning_label]
     llm_depth_options = {
         "Fast: 1 active agent / 12s budget": {"max_agents": 1, "timeout": 12.0, "workers": 1},
         "Balanced: 2 active agents / 18s budget": {"max_agents": 2, "timeout": 18.0, "workers": 2},
@@ -924,7 +942,7 @@ with st.sidebar:
     llm_agent_timeout_seconds = float(llm_depth["timeout"])
     llm_agent_max_workers = int(llm_depth["workers"])
     st.caption(
-        "LLM review now runs as a separate backend job. In confidence-gate mode, every deterministic specialist signal below 90% confidence is sent to OpenRouter for review."
+        "LLM review runs as a separate job. LLM-first mode asks specialist agents to reason from plant state directly; deterministic logic is used only as fallback and safety validation."
     )
 
 try:
@@ -967,6 +985,7 @@ with st.sidebar:
             "llm_agent_max_agents": llm_agent_max_agents,
             "llm_agent_timeout_seconds": llm_agent_timeout_seconds,
             "llm_agent_max_workers": llm_agent_max_workers,
+            "llm_agent_reasoning_mode": llm_agent_reasoning_mode,
         }
         result = api_post(backend_url, "/api/llm-review/start", params=params)
         st.session_state.llm_review_job_id = result["job_id"]

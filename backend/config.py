@@ -228,6 +228,14 @@ if LLM_AGENT_MIN_SEVERITY not in {"low", "medium", "high", "critical"}:
     LLM_AGENT_MIN_SEVERITY = "medium"
 LLM_AGENT_CALL_ON_NORMAL_LOW_RISK = _as_bool(os.getenv("LLM_AGENT_CALL_ON_NORMAL_LOW_RISK", "false"), False)
 
+# Specialist-agent reasoning mode:
+# - hybrid_scaffold: deterministic agents produce the first signal, then OpenRouter reviews it.
+# - llm_first: OpenRouter specialist agents reason from plant state directly; deterministic logic is used only as fallback/safety validation.
+# - deterministic_only: no specialist LLM review even if requested.
+LLM_AGENT_REASONING_MODE = os.getenv("LLM_AGENT_REASONING_MODE", "hybrid_scaffold").strip().lower()
+if LLM_AGENT_REASONING_MODE not in {"hybrid_scaffold", "llm_first", "deterministic_only"}:
+    LLM_AGENT_REASONING_MODE = "hybrid_scaffold"
+
 # Confidence-gated hybrid behavior. When specialist-agent review is requested,
 # any deterministic agent with confidence below this threshold is sent to
 # OpenRouter even during normal / low-risk plant states. Default is 0.90 because
