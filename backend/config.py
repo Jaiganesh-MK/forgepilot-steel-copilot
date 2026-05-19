@@ -229,11 +229,12 @@ if LLM_AGENT_MIN_SEVERITY not in {"low", "medium", "high", "critical"}:
 LLM_AGENT_CALL_ON_NORMAL_LOW_RISK = _as_bool(os.getenv("LLM_AGENT_CALL_ON_NORMAL_LOW_RISK", "false"), False)
 
 # Specialist-agent reasoning mode:
+# - langgraph_llm_first: LangGraph orchestrates LLM-first specialist reasoning from plant state + shared memory; deterministic logic is safety/fallback only.
 # - hybrid_scaffold: deterministic agents produce the first signal, then OpenRouter reviews it.
-# - llm_first: OpenRouter specialist agents reason from plant state directly; deterministic logic is used only as fallback/safety validation.
+# - llm_first: legacy OpenRouter specialist agents reason from plant state directly; deterministic logic is safety/fallback only.
 # - deterministic_only: no specialist LLM review even if requested.
 LLM_AGENT_REASONING_MODE = os.getenv("LLM_AGENT_REASONING_MODE", "hybrid_scaffold").strip().lower()
-if LLM_AGENT_REASONING_MODE not in {"hybrid_scaffold", "llm_first", "deterministic_only"}:
+if LLM_AGENT_REASONING_MODE not in {"langgraph_llm_first", "hybrid_scaffold", "llm_first", "deterministic_only"}:
     LLM_AGENT_REASONING_MODE = "hybrid_scaffold"
 
 # Confidence-gated hybrid behavior. When specialist-agent review is requested,
@@ -241,6 +242,13 @@ if LLM_AGENT_REASONING_MODE not in {"hybrid_scaffold", "llm_first", "determinist
 # OpenRouter even during normal / low-risk plant states. Default is 0.90 because
 # the POC's rule-based agents intentionally remain conservative unless the
 # evidence is very strong.
+
+# LangGraph specialist-agent orchestration. This is optional at runtime; if the
+# package is unavailable the app falls back to the existing LLM-first path.
+USE_LANGGRAPH_AGENTS = _as_bool(os.getenv("USE_LANGGRAPH_AGENTS", "true"), True)
+LANGGRAPH_TOTAL_TIMEOUT_SECONDS = max(5.0, _as_float(os.getenv("LANGGRAPH_TOTAL_TIMEOUT_SECONDS"), 75.0))
+LANGGRAPH_TRACE_ENABLED = _as_bool(os.getenv("LANGGRAPH_TRACE_ENABLED", "true"), True)
+
 LLM_AGENT_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, _as_float(os.getenv("LLM_AGENT_CONFIDENCE_THRESHOLD"), 0.90)))
 LLM_AGENT_REVIEW_LOW_CONFIDENCE = _as_bool(os.getenv("LLM_AGENT_REVIEW_LOW_CONFIDENCE", "true"), True)
 LLM_AGENT_LOW_CONFIDENCE_OVERRIDES_LIMIT = _as_bool(os.getenv("LLM_AGENT_LOW_CONFIDENCE_OVERRIDES_LIMIT", "true"), True)

@@ -812,35 +812,25 @@ class ReasoningSynthesizer:
         return json.dumps(prompt, default=str, separators=(",", ":"))[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
 
     def _build_agent_llm_first_prompt(self, signals: list[AgentSignal], context: PlantContext) -> str:
-        responsibilities = {
-            "ThermalStateAgent": "assess furnace thermal stability and hot/cold drift",
-            "PermeabilityAgent": "assess gas-flow restriction, burden permeability, slip/hang risk",
-            "WindVolumeAgent": "recommend whether wind volume should increase, decrease, or hold",
-            "PCIAgent": "recommend PCI injection adjustments while protecting permeability and thermal reserve",
-            "CokeRateAgent": "recommend coke-rate support for thermal and structural stability",
-            "FuelRateAgent": "assess total fuel balance and efficiency without destabilizing operation",
-            "OxygenEnrichmentAgent": "recommend oxygen enrichment adjustments within safe raceway/thermal limits",
-            "BlastTemperatureAgent": "recommend hot blast temperature adjustment for thermal stabilization",
-            "TopPressureAgent": "recommend top-pressure adjustment while protecting gas-flow stability",
-            "BurdenDistributionAgent": "recommend burden/charging distribution changes for gas-flow and permeability",
-            "TappingAgent": "assess tapping urgency and hearth-management priority",
-            "QualityAgent": "assess hot-metal quality stability, especially silicon/sulfur drift",
-        }
+        """Build a true LLM-first prompt with compact persistent domain memory.
+
+        The model is still stateless on every API call, so this function sends a
+        compact shared memory block plus agent-specific playbooks. The memory block
+        is deliberately stable across calls to make provider-side prompt caching or
+        sticky routing more likely when OpenRouter/provider supports it, while the
+        dynamic plant payload stays small.
+        """
+        expected_names = [s.agent_name for s in signals]
+        playbooks = self._agent_playbooks()
         agent_requests = []
         for signal in signals:
             agent_requests.append({
                 "agent_name": signal.agent_name,
                 "decision_area": signal.decision_area,
-                "responsibility": responsibilities.get(signal.agent_name, f"reason over {signal.decision_area}"),
-                "must_return": [
-                    "diagnosis",
-                    "operator-facing recommendation",
-                    "small bounded proposed_actions only if justified",
-                    "confidence from 0.05 to 0.98",
-                    "evidence using provided plant numbers",
-                    "operator approval prerequisites",
-                ],
+                "playbook": playbooks.get(signal.agent_name, playbooks["DefaultAgent"]),
+                "allowed_action_keys": self._allowed_action_keys_for_agent(signal.agent_name),
             })
+
         allowed_actions = {
             **{key: {"min": lo, "max": hi} for key, (lo, hi) in config.ACTION_LIMITS.items()},
             "burden_distribution_change": "short charging-pattern advisory, or omit",
@@ -848,38 +838,251 @@ class ReasoningSynthesizer:
             "monitoring_action": "non-control workflow instruction, or omit",
         }
         prompt = {
-            "task": "Run LLM-first specialist-agent reasoning for the selected blast-furnace state and return valid JSON only.",
-            "critical_rules": [
-                "Return JSON only. Do not use markdown fences.",
+            "task": "Act as the listed LLM-first specialist blast-furnace agents. Reason independently for each agent and return valid JSON only.",
+            "common_agent_memory_version": "forgepilot_bf_operator_copilot_v2",
+            "common_agent_memory": self._common_agent_memory(),
+            "response_rules": [
+                "Return JSON only. Do not use markdown fences or explanatory preamble.",
                 "The response must be a JSON object with key agent_reviews.",
                 "Return exactly one review per expected_agent_names entry.",
                 "Each review.agent_name must exactly match one expected_agent_names value.",
-                "Do not use or reference a deterministic scaffold; none is provided in this mode.",
-                "Use only the provided plant_state, recent_trends, similar_cases, agent_responsibilities, and allowed_actions.",
-                "Do not invent measurements, targets, or plant events.",
-                "If evidence is weak or plant risk is low, prefer monitoring_action or proposed_actions={}.",
+                "Use only the supplied plant_state, recent_trends, similar_cases, common_agent_memory, agent_playbooks, and allowed_actions.",
+                "Do not invent measurements, targets, causes, or plant events.",
+                "Do not say 'no setpoint action proposed' when the agent playbook thresholds clearly indicate a corrective advisory.",
                 "All setpoint changes are recommendations requiring operator approval; never claim automatic execution.",
-                "Keep numeric changes small and inside allowed_actions.",
+                "Use small bounded setpoint deltas inside allowed_actions; if uncertain, propose a monitoring_action plus the safest small corrective action.",
             ],
             "review_item_shape": {
                 "agent_name": "exact name from expected_agent_names",
                 "severity": "low|medium|high|critical",
-                "confidence": "0.05 to 0.98",
-                "message": "one short operator-facing recommendation",
-                "proposed_actions": "object with allowed action keys only, or empty object",
-                "reasoning_addendum": "one short reason using plant numbers",
+                "confidence": "0.05 to 0.98; lower when evidence conflicts, higher when multiple indicators agree",
+                "message": "operator-facing diagnosis and recommendation in one sentence",
+                "proposed_actions": "object with allowed action keys only; empty only if playbook says hold/monitor",
+                "reasoning_addendum": "one or two sentences using specific plant numbers",
                 "evidence_additions": "array of short strings using provided plant numbers",
                 "prerequisites": "array of checks/approvals",
                 "risk_tags": "array of short tags",
             },
-            "expected_agent_names": [s.agent_name for s in signals],
-            "agent_responsibilities": agent_requests,
+            "expected_agent_names": expected_names,
+            "agent_playbooks": agent_requests,
             "allowed_actions": allowed_actions,
             "plant_state": self._compact_state(context),
             "recent_trends": self._compact_trends(context),
             "similar_cases": context.similar_cases[:2],
+            "examples": self._llm_first_examples(),
         }
-        return json.dumps(prompt, default=str, separators=(",", ":"))[: config.OPENROUTER_AGENT_PROMPT_CHAR_LIMIT]
+        # Do not slice the JSON prompt aggressively. Truncating JSON creates the exact
+        # failure mode seen in the UI: the model loses the operating context and returns
+        # generic placeholders. The payload is still compact and batched, so the shared
+        # memory is sent once per LLM review rather than once per specialist agent.
+        return json.dumps(prompt, default=str, separators=(",", ":"))
+
+    @staticmethod
+    def _common_agent_memory() -> dict[str, Any]:
+        return {
+            "mission": "ForgePilot is an advisory copilot for blast furnace operators. It augments, never replaces, operator judgement.",
+            "operating_principles": [
+                "Stability and safety outrank productivity.",
+                "Do not optimize one lever without considering thermal state, permeability, fuel balance, quality, and hearth/tapping state.",
+                "High pressure drop plus low permeability index is a gas-flow restriction/permeability recovery case.",
+                "Cold thermal state is indicated by low hot metal temperature, low silicon, negative thermal index, weak gas utilization, or falling predicted temperature.",
+                "Hot thermal state is indicated by high hot metal temperature, high silicon, positive thermal index, or excessive RAFT/thermal reserve.",
+                "Poor permeability generally argues against aggressive wind increase, aggressive PCI increase, or production push.",
+                "Weak thermal reserve generally argues for reducing PCI pressure, increasing coke/thermal support, or increasing hot blast/oxygen carefully.",
+                "Use small corrective deltas. All setpoint changes require operator approval.",
+            ],
+            "reference_thresholds": {
+                "hot_metal_temp_c_target": "1480-1510; below 1480 is cold/weak, above 1510 is hot",
+                "hot_metal_si_pct_target": "0.38-0.62; below 0.38 can indicate cold/weak thermal state, above 0.62 can indicate hot state",
+                "thermal_state_index_target": "-0.65 to +0.65; below -0.65 cold, above +0.65 hot",
+                "permeability_index_target": "82-100 typical stable range; below 70 concerning; below 55 severe restriction",
+                "pressure_drop_kpa_target": "130-180 typical operating band; above 180 severe restriction, above 160 elevated",
+                "gas_utilization_pct_target": "46-51.5; below 44 weak efficiency/gas-flow concern",
+                "plant_risk_score": "<30 low, 30-60 medium, 60-80 high, >80 critical",
+            },
+            "allowed_action_meaning": {
+                "wind_volume_delta_nm3_min": "negative reduces wind/gas push; positive increases production/gas flow",
+                "pci_delta_kg_thm": "negative reduces coal injection to protect permeability/thermal reserve; positive improves fuel economy only if stable",
+                "coke_rate_delta_kg_thm": "positive adds thermal/structural support; negative improves cost only when stable",
+                "oxygen_enrichment_delta_pct": "positive raises thermal intensity/productivity; avoid aggressive increase during severe restriction",
+                "blast_temp_delta_c": "positive adds thermal input; use for cold/weak furnace within stove capability",
+                "top_pressure_delta_kpa": "small increase may improve gas utilization; avoid if pressure-drop/slip risk is severe",
+                "burden_distribution_change": "charging-pattern advisory for center/edge gas flow and permeability recovery",
+                "tapping_priority": "hearth/cast-house urgency: Normal, Expedite, or Delay",
+            },
+        }
+
+    @staticmethod
+    def _agent_playbooks() -> dict[str, Any]:
+        return {
+            "ThermalStateAgent": {
+                "role": "Assess hot/cold thermal drift and thermal reserve.",
+                "watch": ["hot_metal_temp_c", "hot_metal_si_pct", "thermal_state_index", "gas_utilization_pct", "predicted_hot_metal_temp_4h_c", "blast_temp_delta trend", "fuel rate"],
+                "decision_logic": [
+                    "If thermal_state_index < -0.65 or hot_metal_temp_c < 1480 or silicon < 0.38, diagnose cold/weak thermal state.",
+                    "For cold/weak state, consider coke_rate_delta_kg_thm +5 to +15, blast_temp_delta_c +10 to +20, oxygen_enrichment_delta_pct +0.1 to +0.3, and avoid PCI increase.",
+                    "If thermal_state_index > 0.65 or hot_metal_temp_c > 1510 or silicon > 0.62, diagnose hot state and consider reducing thermal input.",
+                    "If permeability is severely poor, prioritize stabilization before productivity push.",
+                ],
+                "preferred_actions": ["coke_rate_delta_kg_thm", "blast_temp_delta_c", "oxygen_enrichment_delta_pct", "monitoring_action"],
+            },
+            "PermeabilityAgent": {
+                "role": "Assess gas-flow restriction, burden permeability, hang/slip risk.",
+                "watch": ["permeability_index", "pressure_drop_kpa", "gas_utilization_pct", "top_pressure_kpa", "burden_distribution", "slip risk"],
+                "decision_logic": [
+                    "If pressure_drop_kpa > 180 and permeability_index < 55, diagnose severe permeability loss.",
+                    "If pressure_drop_kpa > 160 or permeability_index < 70, diagnose elevated restriction risk.",
+                    "For severe restriction, recommend wind_volume_delta_nm3_min -50 to -150, pci_delta_kg_thm -5 to -15, burden_distribution_change toward center-coke/permeability recovery, and possibly Expedite tapping if hearth/liquid level supports it.",
+                    "Avoid wind increase, aggressive top pressure increase, and PCI increase during severe restriction.",
+                ],
+                "preferred_actions": ["wind_volume_delta_nm3_min", "pci_delta_kg_thm", "burden_distribution_change", "top_pressure_delta_kpa", "monitoring_action"],
+            },
+            "WindVolumeAgent": {
+                "role": "Recommend wind-volume hold/increase/reduction.",
+                "watch": ["wind_volume_nm3_min", "pressure_drop_kpa", "permeability_index", "thermal_state_index", "production_tph", "gas_utilization_pct"],
+                "decision_logic": [
+                    "Increase wind only when permeability is stable, pressure drop is not elevated, and thermal reserve is adequate.",
+                    "If permeability_index < 70 or pressure_drop_kpa > 160, recommend holding or reducing wind.",
+                    "If permeability_index < 55 and pressure_drop_kpa > 180, recommend wind_volume_delta_nm3_min -50 to -150.",
+                ],
+                "preferred_actions": ["wind_volume_delta_nm3_min", "monitoring_action"],
+            },
+            "PCIAgent": {
+                "role": "Optimize PCI without harming permeability or thermal reserve.",
+                "watch": ["pci_rate_kg_thm", "thermal_state_index", "permeability_index", "pressure_drop_kpa", "hot_metal_temp_c", "gas_utilization_pct"],
+                "decision_logic": [
+                    "If permeability is poor or pressure drop is high, reduce PCI temporarily by -5 to -15 kg/thm.",
+                    "If furnace is cold/weak, do not increase PCI; reduce or hold PCI and coordinate with coke/thermal support.",
+                    "Increase PCI only when thermal state and permeability are stable.",
+                ],
+                "preferred_actions": ["pci_delta_kg_thm", "coke_rate_delta_kg_thm", "monitoring_action"],
+            },
+            "CokeRateAgent": {
+                "role": "Maintain coke support for thermal reserve and bed permeability.",
+                "watch": ["coke_rate_kg_thm", "pci_rate_kg_thm", "thermal_state_index", "permeability_index", "pressure_drop_kpa"],
+                "decision_logic": [
+                    "If furnace is cold/weak or permeability is poor, consider coke_rate_delta_kg_thm +5 to +15.",
+                    "If operation is stable and fuel rate is high, consider holding or small reduction only if other agents agree.",
+                ],
+                "preferred_actions": ["coke_rate_delta_kg_thm", "monitoring_action"],
+            },
+            "FuelRateAgent": {
+                "role": "Assess total fuel balance and energy efficiency while protecting stability.",
+                "watch": ["total_fuel_rate_kg_thm", "coke_rate_kg_thm", "pci_rate_kg_thm", "gas_utilization_pct", "thermal_state_index"],
+                "decision_logic": [
+                    "If stability risk is high, fuel efficiency optimization is secondary.",
+                    "For cold or permeability-loss cases, support coke/thermal recovery rather than chasing low fuel rate.",
+                    "If stable but fuel rate high, recommend monitoring/optimization rather than aggressive cuts.",
+                ],
+                "preferred_actions": ["coke_rate_delta_kg_thm", "pci_delta_kg_thm", "monitoring_action"],
+            },
+            "OxygenEnrichmentAgent": {
+                "role": "Recommend oxygen enrichment adjustments within raceway/thermal safety limits.",
+                "watch": ["oxygen_enrichment_pct", "thermal_state_index", "permeability_index", "pressure_drop_kpa", "gas_utilization_pct", "raceway_adiabatic_flame_temp_c"],
+                "decision_logic": [
+                    "For cold/weak thermal state with manageable permeability, consider +0.1 to +0.3 pct-pt oxygen enrichment.",
+                    "During severe permeability restriction, avoid aggressive enrichment; use at most small +0.1 to +0.2 if thermal support is needed and operator confirms raceway stability.",
+                    "For hot state, consider hold or slight reduction.",
+                ],
+                "preferred_actions": ["oxygen_enrichment_delta_pct", "monitoring_action"],
+            },
+            "BlastTemperatureAgent": {
+                "role": "Recommend hot-blast temperature adjustment for thermal stabilization.",
+                "watch": ["hot_blast_temp_c", "thermal_state_index", "hot_metal_temp_c", "hot_metal_si_pct", "predicted_hot_metal_temp_4h_c"],
+                "decision_logic": [
+                    "If cold/weak thermal state and stove capacity permits, recommend blast_temp_delta_c +10 to +20.",
+                    "If hot state, recommend hold or small reduction.",
+                    "Do not use blast temperature as the only correction for severe permeability loss.",
+                ],
+                "preferred_actions": ["blast_temp_delta_c", "monitoring_action"],
+            },
+            "TopPressureAgent": {
+                "role": "Recommend top-pressure strategy for gas utilization without worsening restriction.",
+                "watch": ["top_pressure_kpa", "pressure_drop_kpa", "permeability_index", "gas_utilization_pct", "slip risk"],
+                "decision_logic": [
+                    "If gas utilization is low but permeability is manageable, small top_pressure_delta_kpa +2 to +5 may help.",
+                    "If severe pressure drop/restriction exists, do not aggressively raise top pressure; prefer hold or very small adjustment with operator confirmation.",
+                ],
+                "preferred_actions": ["top_pressure_delta_kpa", "monitoring_action"],
+            },
+            "BurdenDistributionAgent": {
+                "role": "Recommend charging/burden distribution changes for gas-flow balance and permeability recovery.",
+                "watch": ["permeability_index", "pressure_drop_kpa", "gas_utilization_pct", "burden distribution mode", "stockline asymmetry"],
+                "decision_logic": [
+                    "If edge-heavy/poor permeability signals exist, recommend center-coke/permeability-recovery burden pattern.",
+                    "If gas utilization and permeability are stable, hold distribution and monitor.",
+                    "Charging-pattern changes are advisory and must follow plant-approved burden matrix.",
+                ],
+                "preferred_actions": ["burden_distribution_change", "monitoring_action"],
+            },
+            "TappingAgent": {
+                "role": "Assess hearth/tapping urgency and cast-house priority.",
+                "watch": ["hearth_liquid_level_index", "hot_metal_temp_c", "plant_risk_score", "tapping indicators", "pressure drop"],
+                "decision_logic": [
+                    "If permeability/pressure-drop risk is high and hearth liquid level is elevated, recommend Expedite tapping.",
+                    "If hearth condition is normal, recommend Normal tapping priority and monitoring.",
+                    "Do not create tapping urgency without supporting hearth/liquid-level evidence.",
+                ],
+                "preferred_actions": ["tapping_priority", "monitoring_action"],
+            },
+            "QualityAgent": {
+                "role": "Assess hot-metal quality stability, especially silicon and sulfur drift.",
+                "watch": ["hot_metal_si_pct", "hot_metal_s_pct", "hot_metal_temp_c", "thermal_state_index", "predicted_si_4h_pct"],
+                "decision_logic": [
+                    "Low silicon with cold thermal indicators supports thermal recovery recommendations.",
+                    "High silicon with hot thermal indicators supports thermal input reduction/hold.",
+                    "If quality is in range, propose monitoring rather than setpoint action.",
+                ],
+                "preferred_actions": ["monitoring_action", "blast_temp_delta_c", "coke_rate_delta_kg_thm"],
+            },
+            "DefaultAgent": {
+                "role": "Reason over the assigned decision area using only supplied plant data.",
+                "watch": ["plant_state", "recent_trends"],
+                "decision_logic": ["Recommend monitoring if evidence is weak; otherwise use small bounded corrective actions."],
+                "preferred_actions": ["monitoring_action"],
+            },
+        }
+
+    @staticmethod
+    def _allowed_action_keys_for_agent(agent_name: str) -> list[str]:
+        playbook = ReasoningSynthesizer._agent_playbooks().get(agent_name, {})
+        keys = list(playbook.get("preferred_actions") or ["monitoring_action"])
+        return keys
+
+    @staticmethod
+    def _llm_first_examples() -> list[dict[str, Any]]:
+        return [
+            {
+                "case": "severe permeability loss",
+                "signals": "pressure_drop_kpa=182.8, permeability_index=48.7, gas_utilization_pct=41.3, thermal_state_index=-0.76",
+                "good_review": {
+                    "agent_name": "PermeabilityAgent",
+                    "severity": "critical",
+                    "confidence": 0.9,
+                    "message": "Permeability loss is severe; prioritize flow recovery and avoid production push.",
+                    "proposed_actions": {"wind_volume_delta_nm3_min": -75, "pci_delta_kg_thm": -8, "burden_distribution_change": "Use center-coke permeability-recovery charging matrix"},
+                    "reasoning_addendum": "Pressure drop is above 180 kPa while permeability index is below 55, indicating severe gas-flow restriction.",
+                    "evidence_additions": ["pressure_drop_kpa=182.8", "permeability_index=48.7", "gas_utilization_pct=41.3"],
+                    "prerequisites": ["operator approval required", "confirm pressure/drop and burden probes", "check recent slips/hangs"],
+                    "risk_tags": ["permeability", "gas_flow", "operator_approval"],
+                },
+            },
+            {
+                "case": "normal low-risk state",
+                "signals": "plant_risk_score=16.5, permeability_index=145, pressure_drop_kpa=105",
+                "good_review": {
+                    "agent_name": "WindVolumeAgent",
+                    "severity": "low",
+                    "confidence": 0.72,
+                    "message": "Wind volume should be held; no production push is required from the available evidence.",
+                    "proposed_actions": {"monitoring_action": "Continue normal monitoring of wind, pressure drop, and permeability trend."},
+                    "reasoning_addendum": "Low plant risk and low pressure drop do not justify a setpoint change.",
+                    "evidence_additions": ["plant_risk_score=16.5", "pressure_drop_kpa=105", "permeability_index=145"],
+                    "prerequisites": ["operator approval required for any setpoint change"],
+                    "risk_tags": ["normal_monitoring"],
+                },
+            },
+        ]
 
     def _agent_prompt_payload(self, signals: list[AgentSignal], context: PlantContext) -> dict[str, Any]:
         allowed_actions = {

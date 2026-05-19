@@ -4,3 +4,5 @@ numpy>=1.26.0
 plotly>=5.22.0
 requests>=2.32.0
 python-dotenv>=1.0.0
+
+langgraph>=0.2.50

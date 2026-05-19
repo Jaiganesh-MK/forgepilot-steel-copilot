@@ -24,6 +24,7 @@ from .agents import (
 )
 from .llm import ReasoningSynthesizer
 from .safety_gate import assign_automation, plant_risk_level
+from .langgraph_agents import LangGraphSpecialistOrchestrator
 
 
 class AgentCoordinator:
@@ -45,6 +46,8 @@ class AgentCoordinator:
             QualityAgent(),
         ]
         self.synthesizer = ReasoningSynthesizer()
+        self.langgraph_orchestrator = LangGraphSpecialistOrchestrator(self.synthesizer, self.agents)
+        self._last_langgraph_status: dict[str, Any] = {}
         self._last_llm_agent_requested: list[str] = []
         self._last_llm_agent_reviewed: list[str] = []
 
@@ -60,11 +63,21 @@ class AgentCoordinator:
     ) -> dict[str, Any]:
         deterministic_signals = [agent.evaluate(context) for agent in self.agents]
         requested_mode = (llm_agent_reasoning_mode or config.LLM_AGENT_REASONING_MODE or "hybrid_scaffold").strip().lower()
-        if requested_mode not in {"hybrid_scaffold", "llm_first", "deterministic_only"}:
+        if requested_mode not in {"langgraph_llm_first", "hybrid_scaffold", "llm_first", "deterministic_only"}:
             requested_mode = "hybrid_scaffold"
         llm_agent_requested = bool(include_llm_agents or config.USE_LLM_AGENTS) and requested_mode != "deterministic_only"
 
-        if llm_agent_requested and requested_mode == "llm_first":
+        if llm_agent_requested and requested_mode == "langgraph_llm_first":
+            graph_signals, graph_status = self.langgraph_orchestrator.run(
+                context,
+                deterministic_signals,
+                max_agents=llm_agent_max_agents,
+                timeout_seconds=llm_agent_timeout_seconds,
+            )
+            self._last_langgraph_status = graph_status
+            signals = graph_signals
+        elif llm_agent_requested and requested_mode == "llm_first":
+            self._last_langgraph_status = {}
             seed_signals = self._make_llm_first_seed_signals(context, deterministic_signals)
             reviewed_seed_signals = self._review_signals_with_llm(
                 seed_signals,
@@ -83,6 +96,7 @@ class AgentCoordinator:
                 max_workers=llm_agent_max_workers,
             )
         else:
+            self._last_langgraph_status = {}
             signals = deterministic_signals
         self._last_llm_agent_requested = [s.agent_name for s in signals if (s.metadata or {}).get("llm_review_requested")]
         self._last_llm_agent_reviewed = [s.agent_name for s in signals if (s.metadata or {}).get("llm_used")]
@@ -360,7 +374,10 @@ class AgentCoordinator:
                 "llm_agent_confidence_threshold": config.LLM_AGENT_CONFIDENCE_THRESHOLD,
                 "llm_agent_review_low_confidence": config.LLM_AGENT_REVIEW_LOW_CONFIDENCE,
                 "llm_agent_low_confidence_overrides_limit": config.LLM_AGENT_LOW_CONFIDENCE_OVERRIDES_LIMIT,
-                "llm_agent_note": "Reasoning mode controls specialist behavior: hybrid_scaffold sends deterministic signals for LLM review; llm_first asks LLM specialists to reason from plant state directly and uses deterministic logic only as fallback/safety validation.",
+                "langgraph_specialist_agents_enabled": config.USE_LANGGRAPH_AGENTS,
+                "langgraph_specialist_agents_available": bool(getattr(self.langgraph_orchestrator, "available", False)),
+                "langgraph_status": self._last_langgraph_status,
+                "llm_agent_note": "Reasoning mode controls specialist behavior: langgraph_llm_first uses LangGraph to orchestrate LLM-first specialist reasoning from shared memory and plant state; hybrid_scaffold sends deterministic signals for LLM review; llm_first is the legacy direct OpenRouter path; deterministic_only disables specialist LLM review.",
             }
         )
         return status

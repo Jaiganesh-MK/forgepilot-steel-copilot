@@ -914,6 +914,7 @@ with st.sidebar:
     include_llm_agents = st.toggle("Review specialist agents with OpenRouter", value=False)
     include_llm = st.toggle("Generate final OpenRouter reasoning summary", value=False)
     llm_reasoning_labels = {
+        "LangGraph LLM-first agents + deterministic safety validation": "langgraph_llm_first",
         "LLM-first agents + deterministic safety validation": "llm_first",
         "Deterministic scaffold + LLM review": "hybrid_scaffold",
         "Deterministic only": "deterministic_only",
@@ -942,7 +943,7 @@ with st.sidebar:
     llm_agent_timeout_seconds = float(llm_depth["timeout"])
     llm_agent_max_workers = int(llm_depth["workers"])
     st.caption(
-        "LLM review runs as a separate job. LLM-first mode asks specialist agents to reason from plant state directly; deterministic logic is used only as fallback and safety validation."
+        "LLM review runs as a separate job. LangGraph mode orchestrates specialist-agent reasoning from shared memory, plant state, trends, similar cases, and allowed action bounds; deterministic logic is used only as fallback and safety validation."
     )
 
 try:
